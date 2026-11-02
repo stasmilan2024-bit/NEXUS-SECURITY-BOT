@@ -1,12 +1,25 @@
-import discord
-from discord.ext import commands
-from discord import app_commands
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import os
 import re
 import collections
 from datetime import datetime, timedelta
+import discord
+from discord.ext import commands
+from discord import app_commands
 
-TOKEN_FILE = 'token.txt'
+def run_server():
+    class SimpleHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"Bot is alive!")
+    
+    server = HTTPServer(('0.0.0.0', 10000), SimpleHandler)
+    server.serve_forever()
+
+# Запускаем веб-сервер в отдельном потоке, чтобы Render видел порт
+threading.Thread(target=run_server, daemon=True).start()
 
 # --- ІНІЦІАЛІЗАЦІЯ БОТА ---
 intents = discord.Intents.default()
@@ -17,7 +30,6 @@ intents.moderation = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Словники для відстеження спаму та захисту
 message_history = collections.defaultdict(list)
 ban_history = collections.defaultdict(list)
 channel_delete_history = collections.defaultdict(list)
@@ -31,20 +43,17 @@ async def on_ready():
     except Exception as e:
         print(f'Помилка синхронізації команд: {e}')
 
-# --- 1. ЗАХИСТ ВІД СПАМУ ТА ПОСИЛАНЬ ---
 @bot.event
 async def on_message(message):
     if message.author.bot or message.guild is None:
         return
 
-    # Адмінам можна писати все
     if message.author.guild_permissions.administrator:
         return
 
     author_id = message.author.id
     now = datetime.now()
 
-    # Фільтр посилань (блокування сторонніх сайтів та Discord-серверів)
     url_pattern = r'(https?://[^\s]+|www\.[^\s]+|discord\.gg/[^\s]+)'
     if re.search(url_pattern, message.content):
         try:
@@ -54,7 +63,6 @@ async def on_message(message):
         except Exception:
             pass
 
-    # Анти-спам (більше 5 повідомлень за 4 секунди)
     message_history[author_id].append(now)
     message_history[author_id] = [t for t in message_history[author_id] if now - t < timedelta(seconds=4)]
 
@@ -66,7 +74,6 @@ async def on_message(message):
         except Exception:
             pass
 
-# --- 2. ЗАХИСТ ВІД ЗНОСУ СЕРВЕРА (ANTI-NUKE) ---
 @bot.event
 async def on_member_ban(guild, user):
     async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.ban):
@@ -107,9 +114,6 @@ async def on_guild_channel_delete(channel):
                     await owner.send(f"🚨 **УВАГА!** Користувач `{executor}` намагався видалити канали та був заблокований!")
             except Exception as e:
                 print(f"Помилка захисту каналів: {e}")
-
-
-# --- 3. СЛЕШ-КОМАНДИ МОДЕРАЦІЇ ---
 
 @bot.tree.command(name="help", description="Показати список команд модерації та безпеки")
 async def slash_help(interaction: discord.Interaction):
@@ -165,12 +169,9 @@ async def slash_ban(interaction: discord.Interaction, member: discord.Member, re
     except Exception as e:
         await interaction.response.send_message(f"❌ Помилка: {e}", ephemeral=True)
 
-
-# --- ЗАПУСК БОТА ---
 if __name__ == '__main__':
-    if os.path.exists(TOKEN_FILE):
-        with open(TOKEN_FILE, 'r', encoding='utf-8') as f:
-            TOKEN = f.read().strip()
+    TOKEN = os.getenv("DISCORD_TOKEN")
+    if TOKEN:
         bot.run(TOKEN)
     else:
-        print(f"Помилка: Файл {TOKEN_FILE} не знайдено!")
+        print("Помилка: Не знайдено змінну середовища DISCORD_TOKEN!")
