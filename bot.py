@@ -1,13 +1,15 @@
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
 import os
 import re
+import threading
 import collections
 from datetime import datetime, timedelta
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
 import discord
 from discord.ext import commands
 from discord import app_commands
 
+# --- ВЕБ-СЕРВЕР ДЛЯ RENDER ---
 def run_server():
     class SimpleHandler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -18,7 +20,7 @@ def run_server():
     server = HTTPServer(('0.0.0.0', 10000), SimpleHandler)
     server.serve_forever()
 
-# Запускаем веб-сервер в отдельном потоке, чтобы Render видел порт
+# Запускаємо веб-сервер у окремому потоці, щоб Render бачив порт
 threading.Thread(target=run_server, daemon=True).start()
 
 # --- ІНІЦІАЛІЗАЦІЯ БОТА ---
@@ -30,10 +32,32 @@ intents.moderation = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# Збереження історії для Anti-Nuke та Anti-Spam
 message_history = collections.defaultdict(list)
 ban_history = collections.defaultdict(list)
 channel_delete_history = collections.defaultdict(list)
 
+# --- ВІТАЛЬНА СИСТЕМА ---
+WELCOME_CHANNEL_ID = 1566880572029018203
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    channel = member.guild.get_channel(WELCOME_CHANNEL_ID)
+    if channel:
+        embed = discord.Embed(
+            title=f"Вітаємо на ELITE RP, {member.name}! 👋",
+            description=(
+                f"Привіт, {member.mention}!\n\n"
+                f"**Раді бачити тебе на нашому сервері!** 🎉\n"
+                f"Будь ласка, обов'язково ознайомся з правилами сервера перед початком гри."
+            ),
+            color=discord.Color.blue()
+        )
+        embed.set_thumbnail(url=member.display_avatar.url)
+        embed.set_footer(text="ELITE RP | Система безпеки")
+        await channel.send(content=f"{member.mention}", embed=embed)
+
+# --- ПОДІЇ БОТА ---
 @bot.event
 async def on_ready():
     print(f'Бот успішно увійшов в систему як {bot.user} і охороняє сервер!')
@@ -54,6 +78,7 @@ async def on_message(message):
     author_id = message.author.id
     now = datetime.now()
 
+    # Захист від посилань
     url_pattern = r'(https?://[^\s]+|www\.[^\s]+|discord\.gg/[^\s]+)'
     if re.search(url_pattern, message.content):
         try:
@@ -63,6 +88,7 @@ async def on_message(message):
         except Exception:
             pass
 
+    # Захист від спаму
     message_history[author_id].append(now)
     message_history[author_id] = [t for t in message_history[author_id] if now - t < timedelta(seconds=4)]
 
@@ -115,6 +141,7 @@ async def on_guild_channel_delete(channel):
             except Exception as e:
                 print(f"Помилка захисту каналів: {e}")
 
+# --- СЛЕШ-КОМАНДИ МОДЕРАЦІЇ ---
 @bot.tree.command(name="help", description="Показати список команд модерації та безпеки")
 async def slash_help(interaction: discord.Interaction):
     embed = discord.Embed(title="📜 Меню команд модерації та безпеки", color=discord.Color.blue())
@@ -123,7 +150,7 @@ async def slash_help(interaction: discord.Interaction):
     embed.add_field(name="`/unmute [@користувач]`", value="Зняти мут з користувача", inline=False)
     embed.add_field(name="`/kick [@користувач]`", value="Вигнати користувача з сервера", inline=False)
     embed.add_field(name="`/ban [@користувач]`", value="Забанити користувача на сервері", inline=False)
-    embed.set_footer(text="DARK GTA | Система безпеки")
+    embed.set_footer(text="ELITE RP | Система безпеки")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="clear", description="Очистити чат від повідомлень")
@@ -169,6 +196,7 @@ async def slash_ban(interaction: discord.Interaction, member: discord.Member, re
     except Exception as e:
         await interaction.response.send_message(f"❌ Помилка: {e}", ephemeral=True)
 
+# --- ЗАПУСК БОТА ---
 if __name__ == '__main__':
     TOKEN = os.getenv("DISCORD_TOKEN")
     if TOKEN:
