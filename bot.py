@@ -141,7 +141,7 @@ async def on_guild_channel_delete(channel):
             except Exception as e:
                 print(f"Помилка захисту каналів: {e}")
 
-# --- СЛЕШ-КОМАНДИ МОДЕРАЦІЇ ---
+# --- СЛЕШ-КОМАНДИ МОДЕРАЦІЇ ТА ОГОЛОШЕНЬ ---
 @bot.tree.command(name="help", description="Показати список команд модерації та безпеки")
 async def slash_help(interaction: discord.Interaction):
     embed = discord.Embed(title="📜 Меню команд модерації та безпеки", color=discord.Color.blue())
@@ -150,6 +150,7 @@ async def slash_help(interaction: discord.Interaction):
     embed.add_field(name="`/unmute [@користувач]`", value="Зняти мут з користувача", inline=False)
     embed.add_field(name="`/kick [@користувач]`", value="Вигнати користувача з сервера", inline=False)
     embed.add_field(name="`/ban [@користувач]`", value="Забанити користувача на сервері", inline=False)
+    embed.add_field(name="`/say [канал] [заголовок] [текст]`", value="Надіслати красиве оголошення від імені бота", inline=False)
     embed.set_footer(text="ELITE RP | Система безпеки")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -195,6 +196,41 @@ async def slash_ban(interaction: discord.Interaction, member: discord.Member, re
         await interaction.response.send_message(f"🔨 Користувача {member.mention} забанено на сервері.", ephemeral=True)
     except Exception as e:
         await interaction.response.send_message(f"❌ Помилка: {e}", ephemeral=True)
+
+@bot.tree.command(name="say", description="Надіслати оголошення від імені бота")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(
+    channel="Канал для відправки",
+    title="Заголовок оголошення",
+    text="Основний текст оголошення",
+    ping_everyone="Чи потрібно згадувати @everyone? (True/False)",
+    image_url="Посилання на картинку (необов'язково)"
+)
+async def slash_say(
+    interaction: discord.Interaction, 
+    channel: discord.TextChannel, 
+    title: str, 
+    text: str,
+    ping_everyone: bool = False,
+    image_url: str = None
+):
+    embed = discord.Embed(
+        title=title,
+        description=text,
+        color=discord.Color.blue()
+    )
+    embed.set_footer(text="ELITE RP | Офіційне повідомлення")
+    
+    if image_url:
+        embed.set_image(url=image_url)
+    
+    content_text = "@everyone" if ping_everyone else None
+    
+    try:
+        await channel.send(content=content_text, embed=embed)
+        await interaction.response.send_message("✅ Оголошення успішно надіслано!", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Помилка при відправці: {e}", ephemeral=True)
 
 # --- ЗАПУСК БОТА ---
 if __name__ == '__main__':
