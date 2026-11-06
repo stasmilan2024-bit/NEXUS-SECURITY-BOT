@@ -91,7 +91,7 @@ async def on_message(message):
     # --- ОБРОБКА ПОСИЛАНЬ ---
     if has_link:
         if not is_admin_or_mod:
-            # Звичайним користувачам заборонено будь-які посилання
+            # Ззвичайним користувачам заборонено будь-які посилання
             try:
                 await message.delete()
                 await message.channel.send(f'{message.author.mention}, посилання суворо заборонені на сервері!', delete_after=5)
@@ -113,6 +113,9 @@ async def on_message(message):
                     return
                 except Exception:
                     pass
+
+    # Обробка стандартних префіксних команд (наприклад, !forum)
+    await bot.process_commands(message)
 
     # --- ЗАХИСТ ВІД СПАМУ (для звичайних користувачів) ---
     if not is_admin_or_mod:
@@ -168,7 +171,7 @@ async def on_guild_channel_delete(channel):
             except Exception as e:
                 print(f"Помилка захисту каналів: {e}")
 
-# --- СЛЕШ-КОМАНДИ МОДЕРАЦІЇ ТА ОГОЛОШЕНЬ ---
+# --- СЛЕШ-КОМАНДИ МОДЕРАЦІЇ ТА ІНФОРМАЦІЇ ---
 @bot.tree.command(name="help", description="Показати список команд модерації та безпеки")
 async def slash_help(interaction: discord.Interaction):
     embed = discord.Embed(title="📜 Меню команд модерації та безпеки", color=discord.Color.blue())
@@ -178,6 +181,7 @@ async def slash_help(interaction: discord.Interaction):
     embed.add_field(name="`/kick [@користувач]`", value="Вигнати користувача з сервера", inline=False)
     embed.add_field(name="`/ban [@користувач]`", value="Забанити користувача на сервері", inline=False)
     embed.add_field(name="`/say [канал] [заголовок] [текст]`", value="Надіслати красиве оголошення від імені бота", inline=False)
+    embed.add_field(name="`/forum` або `!forum`", value="Отримати посилання на форум", inline=False)
     embed.set_footer(text="ELITE RP | Система безпеки")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -258,6 +262,45 @@ async def slash_say(
         await interaction.response.send_message("✅ Оголошення успішно надіслано!", ephemeral=True)
     except Exception as e:
         await interaction.response.send_message(f"❌ Помилка при відправці: {e}", ephemeral=True)
+
+# --- КОМАНДА ДЛЯ ПОСИЛАННЯ НА ФОРУМ ---
+@bot.tree.command(name="forum", description="Отримати посилання на офіційний форум ELITE RP")
+async def slash_forum(interaction: discord.Interaction):
+    view = discord.ui.View()
+    forum_button = discord.ui.Button(
+        label="Перейти на форум", 
+        url="http://eliterpforum.sytes.net/index.php",
+        style=discord.ButtonStyle.link
+    )
+    view.add_item(forum_button)
+
+    embed = discord.Embed(
+        title="🌐 Офіційний форум ELITE RP",
+        description="Натисніть кнопку нижче, щоб перейти на наш форум!",
+        color=discord.Color.blue()
+    )
+    embed.set_footer(text="ELITE RP | Інформаційна система")
+
+    await interaction.response.send_message(embed=embed, view=view)
+
+@bot.command(name="forum")
+async def text_forum(ctx):
+    view = discord.ui.View()
+    forum_button = discord.ui.Button(
+        label="Перейти на форум", 
+        url="http://eliterpforum.sytes.net/index.php",
+        style=discord.ButtonStyle.link
+    )
+    view.add_item(forum_button)
+
+    embed = discord.Embed(
+        title="🌐 Офіційний форум ELITE RP",
+        description="Натисніть кнопку нижче, щоб перейти на наш форум!",
+        color=discord.Color.blue()
+    )
+    embed.set_footer(text="ELITE RP | Інформаційна система")
+
+    await ctx.send(embed=embed, view=view)
 
 # --- ЗАПУСК БОТА ---
 if __name__ == '__main__':
