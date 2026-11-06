@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 
 # --- ВЕБ-СЕРВЕР ДЛЯ RENDER ---
@@ -30,18 +30,147 @@ intents.message_content = True
 intents.members = True
 intents.guilds = True
 intents.moderation = True
+intents.voice_states = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Збереження історії для Anti-Nuke, Anti-Spam та Ліміту посилань
+# Збереження історії та статистики активності
 message_history = collections.defaultdict(list)
 link_history = collections.defaultdict(list)
 ban_history = collections.defaultdict(list)
 channel_delete_history = collections.defaultdict(list)
 
-# --- ВІТАЛЬНА СИСТЕМА ---
-WELCOME_CHANNEL_ID = 1566880572029018203
+# Бази даних активності в пам'яті бота: {user_id: count}
+user_messages = collections.defaultdict(int)
+user_voice_minutes = collections.defaultdict(int)
+# Відстеження часу входу у войс: {user_id: datetime}
+voice_join_times = {}
 
+# --- ID КАНАЛІВ ТА НАЛАШТУВАННЯ ---
+WELCOME_CHANNEL_ID = 1566880572029018203
+STATS_CHANNEL_ID = 1568373943138787349  # Канал куди бот оновлює статистику
+RANK_CHANNEL_ID = 1405600879587098644    # Канал де працює команда !rank
+
+# Налаштування лімітів для ролей
+REQUIRED_MESSAGES = 5000  # Для ролі "Майстер"
+REQUIRED_VOICE_HOURS = 50 # Для ролі "Активний" (50 годин)
+
+# Змінна для зберігання ID повідомлення зі статистикою, щоб його оновлювати
+stats_message_id = None
+
+
+# --- ФОНОВА ЗАДАЧА: ПІДРАХУНОК ВОЙСУ ТА ОНОВЛЕННЯ СТАТИСТИКИ ---
+@tasks.loop(seconds=60)
+async def activity_loop():
+    global stats_message_id
+    now = datetime.now()
+
+    # 1. Рахуємо хвилини у войсі для всіх, хто зараз сидить у голосових каналах
+    for guild in bot.guilds:
+        for member in guild.members:
+            if member.voice and member.voice.channel and not member.bot:
+                user_voice_minutes[member.id] += 1
+
+        # 2. Перевірка та видача ролей на основі умов
+        for member in guild.members:
+            if member.bot:
+                continue
+            
+            m_count = user_messages[member.id]
+            v_hours = user_voice_minutes[member.id] / 60.0
+
+            # Шукаємо ролі на сервері за назвами
+            role_master = discord.utils.get(guild.roles, name="Майстер")
+            role_active = discord.utils.get(guild.roles, name="Активний")
+            role_incredible = discord.utils.get(guild.roles, name="Неймовірний")
+
+            has_master = role_master in member.roles
+            has_active = role_active in member.roles
+            has_incredible = role_incredible in member.roles
+
+            # Умова для Майстра (повідомлення)
+            if m_count >= REQUIRED_MESSAGES and role_master and not has_master:
+                try:
+                    await member.add_roles(role_master)
+                except Exception:
+                    pass
+
+            # Умова для Активного (гойдини у войсі)
+            if v_hours >= REQUIRED_VOICE_HOURS and role_active and not has_active:
+                try:
+                    await member.add_roles(role_active)
+                except Exception:
+                    pass
+
+            # Умова для Неймовірного (якщо є і Майстер, і Активний)
+            is_master_now = m_count >= REQUIRED_MESSAGES
+            is_active_now = v_hours >= REQUIRED_VOICE_HOURS
+
+            if is_master_now and is_active_now and role_incredible and not has_incredible:
+                try:
+                    await member.add_roles(role_incredible)
+                except Exception:
+                    pass
+
+    # 3. Автооновлення інформаційного повідомлення в статистичному каналі
+    stats_channel = bot.get_channel(STATS_CHANNEL_ID)
+    if stats_channel:
+        embed = discord.Embed(
+            title="📊 Статистика активності гравців ELITE RP",
+            description="Цє повідомлення автоматично оновлюється в реальному часі.",
+            color=discord.Color.blue()
+        )
+        
+        # Знаходимо топ-5 за повідомленнями
+        top_msg = sorted(user_messages.items(), key=lambda x: x[1], reverse=True)[:5]
+        msg_text = ""
+        for idx, (uid, count) in enumerate(top_msg, 1):
+            user_obj = bot.get_user(uid)
+            name = user_obj.name if user_obj else f"ID: {uid}"
+            msg_text += f"**{idx}.** {name} — **{count}** пов.\n"
+        
+        embed.add_field(name="💬 Топ за повідомленнями (Майстри)", value=msg_text if msg_text else "Поки немає даних", inline=False)
+
+        # Знаходимо топ-5 за часом у войсі
+        top_voice = sorted(user_voice_minutes.items(), key=lambda x: x[1], reverse=True)[:5]
+        voice_text = ""
+        for idx, (uid, mins) in enumerate(top_voice, 1):
+            user_obj = bot.get_user(uid)
+            name = user_obj.name if user_obj else f"ID: {uid}"
+            hours = round(mins / 60, 1)
+            voice_text += f"**{idx}.** {name} — **{hours}** год.\n"
+
+        embed.add_field(name="🎙️ Топ за часом у войсі (Активні)", value=voice_text if voice_text else "Поки немає даних", inline=False)
+        embed.set_footer(text=f"Останнє оновлення: {now.strftime('%H:%M:%S')}")
+
+        try:
+            if stats_message_id:
+                try:
+                    msg = await stats_channel.fetch_message(stats_message_id)
+                    await msg.edit(embed=embed)
+                except Exception:
+                    # Якщо повідомлення було видалене, відправляємо нове
+                    msg = await stats_channel.send(embed=embed)
+                    stats_message_id = msg.id
+            else:
+                # Шукаємо останнє повідомлення бота в тому каналі або створюємо нове
+                async for message in stats_channel.history(limit=5):
+                    if message.author == bot.user:
+                        stats_message_id = message.id
+                        await message.edit(embed=embed)
+                        break
+                else:
+                    msg = await stats_channel.send(embed=embed)
+                    stats_message_id = msg.id
+        except Exception as e:
+            print(f"Помилка оновлення статистики: {e}")
+
+@activity_loop.before_loop
+async def before_activity_loop():
+    await bot.wait_until_ready()
+
+
+# --- ВІТАЛЬНА СИСТЕМА ---
 @bot.event
 async def on_member_join(member: discord.Member):
     channel = member.guild.get_channel(WELCOME_CHANNEL_ID)
@@ -63,6 +192,8 @@ async def on_member_join(member: discord.Member):
 @bot.event
 async def on_ready():
     print(f'Бот успішно увійшов в систему як {bot.user} і охороняє сервер!')
+    if not activity_loop.is_running():
+        activity_loop.start()
     try:
         synced = await bot.tree.sync()
         print(f'Синхронізовано слеш-команд: {len(synced)}')
@@ -78,7 +209,9 @@ async def on_message(message):
     now = datetime.now()
     perms = message.author.guild_permissions
 
-    # Перевірка чи є в користувача адміністративні/модераторські права
+    # Збільшуємо лічильник повідомлень для системи активності
+    user_messages[author_id] += 1
+
     is_admin_or_mod = (
         perms.administrator or 
         perms.manage_messages or 
@@ -127,6 +260,51 @@ async def on_message(message):
                 await message.channel.send(f'⚠️ {message.author.mention} отримав мут на 5 хвилин за спам!', delete_after=5)
             except Exception:
                 pass
+
+# --- ТЕКСТОВА КОМАНДА !rank (Працює ТІЛЬКИ в каналі 1405600879587098644) ---
+@bot.command(name="rank")
+async def text_rank(ctx):
+    # Перевірка чи команда викликана у правильному каналі
+    if ctx.channel.id != RANK_CHANNEL_ID:
+        try:
+            await ctx.message.delete()
+        except Exception:
+            pass
+        temp_msg = await ctx.send(f"❌ Команда `!rank` доступна лише у спеціальному каналі!", delete_after=4)
+        return
+
+    user_id = ctx.author.id
+    m_count = user_messages[user_id]
+    v_hours = round(user_voice_minutes[user_id] / 60, 1)
+
+    embed = discord.Embed(
+        title=f"📊 Ваш ранг та активність — {ctx.author.name}",
+        color=discord.Color.green()
+    )
+    embed.set_thumbnail(url=ctx.author.display_avatar.url)
+    embed.add_field(name="💬 Повідомлень у чаті", value=f"**{m_count}** / {REQUIRED_MESSAGES} (Роль: Майстер)", inline=False)
+    embed.add_field(name="🎙️ Час у войсі", value=f"**{v_hours}** год. / {REQUIRED_VOICE_HOURS} год. (Роль: Активний)", inline=False)
+    
+    # Визначаємо поточні досягнуті статуси
+    status_list = []
+    if m_count >= REQUIRED_MESSAGES:
+        status_list.append("✅ Майстер")
+    if v_hours >= REQUIRED_VOICE_HOURS:
+        status_list.append("✅ Активний")
+    if m_count >= REQUIRED_MESSAGES and v_hours >= REQUIRED_VOICE_HOURS:
+        status_list.append("🔥 Неймовірний")
+
+    embed.add_field(name="🏆 Досягнуті статуси", value=", ".join(status_list) if status_list else "Ще немає досягнень", inline=False)
+    embed.set_footer(text="ELITE RP | Система активності")
+
+    # Видаляємо повідомлення користувача з командою і надсилаємо відповідь з автовидаленням через 5 секунд
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+
+    await ctx.send(embed=embed, delete_after=5)
+
 
 @bot.event
 async def on_member_ban(guild, user):
@@ -180,6 +358,7 @@ async def slash_help(interaction: discord.Interaction):
     embed.add_field(name="`/ban [@користувач]`", value="Забанити користувача на сервері", inline=False)
     embed.add_field(name="`/say [канал] [заголовок] [текст]`", value="Надіслати оголошення від імені бота", inline=False)
     embed.add_field(name="`/форум` або `!форум`", value="Отримати посилання на форум", inline=False)
+    embed.add_field(name="`!rank`", value="Перевірити свій ранг та активність (у спец. каналі)", inline=False)
     embed.add_field(name="`/poll [питання]`", value="Створити опитування з реакціями", inline=False)
     embed.add_field(name="`/roll [макс_число]`", value="Кинути випадкове число (кубик)", inline=False)
     embed.set_footer(text="ELITE RP | Система безпеки")
@@ -259,7 +438,6 @@ async def slash_say(
     
     try:
         await channel.send(content=content_text, embed=embed)
-        # Відповідь буде виведена приватно (ephemeral=True), тобто видима лише адміну, який викликав команду
         await interaction.response.send_message("✅ Оголошення успішно надіслано!", ephemeral=True)
     except Exception as e:
         await interaction.response.send_message(f"❌ Помилка при відправці: {e}", ephemeral=True)
@@ -293,7 +471,6 @@ async def slash_roll(interaction: discord.Interaction, max_num: int = 100):
         description=f"{interaction.user.mention} викинув число **{result}** (з {max_num})!",
         color=discord.Color.purple()
     )
-    # Зроблено ephemeral=True, щоб результат ролу бачив лише той, хто кидав кубик (або можна прибрати, якщо хочете публічно)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # --- КОМАНДА ДЛЯ ПОСИЛАННЯ НА ФОРУМ (З автовидаленням) ---
@@ -333,13 +510,11 @@ async def text_forum(ctx):
     )
     embed.set_footer(text="ELITE RP | Інформаційна система")
 
-    # Видаляємо повідомлення користувача з командою
     try:
         await ctx.message.delete()
     except Exception:
         pass
 
-    # Відправляємо повідомлення і видаляємо його через 5 секунд
     await ctx.send(embed=embed, view=view, delete_after=5)
 
 # --- ЗАПУСК БОТА ---
