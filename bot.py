@@ -32,8 +32,9 @@ intents.moderation = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Збереження історії для Anti-Nuke та Anti-Spam
+# Збереження історії для Anti-Nuke, Anti-Spam та Ліміту посилань
 message_history = collections.defaultdict(list)
+link_history = collections.defaultdict(list)
 ban_history = collections.defaultdict(list)
 channel_delete_history = collections.defaultdict(list)
 
@@ -72,33 +73,59 @@ async def on_message(message):
     if message.author.bot or message.guild is None:
         return
 
-    if message.author.guild_permissions.administrator:
-        return
-
     author_id = message.author.id
     now = datetime.now()
+    perms = message.author.guild_permissions
 
-    # Захист від посилань
+    # Перевірка чи є в користувача адміністративні/модераторські права
+    is_admin_or_mod = (
+        perms.administrator or 
+        perms.manage_messages or 
+        perms.kick_members or 
+        perms.ban_members
+    )
+
     url_pattern = r'(https?://[^\s]+|www\.[^\s]+|discord\.gg/[^\s]+)'
-    if re.search(url_pattern, message.content):
-        try:
-            await message.delete()
-            await message.channel.send(f'{message.author.mention}, посилання суворо заборонені на сервері!', delete_after=5)
-            return
-        except Exception:
-            pass
+    has_link = bool(re.search(url_pattern, message.content))
 
-    # Захист від спаму
-    message_history[author_id].append(now)
-    message_history[author_id] = [t for t in message_history[author_id] if now - t < timedelta(seconds=4)]
+    # --- ОБРОБКА ПОСИЛАНЬ ---
+    if has_link:
+        if not is_admin_or_mod:
+            # Звичайним користувачам заборонено будь-які посилання
+            try:
+                await message.delete()
+                await message.channel.send(f'{message.author.mention}, посилання суворо заборонені на сервері!', delete_after=5)
+                return
+            except Exception:
+                pass
+        else:
+            # Для адміністрації: ліміт 3 посилання на 1 хвилину (60 сек)
+            link_history[author_id].append(now)
+            link_history[author_id] = [t for t in link_history[author_id] if now - t < timedelta(seconds=60)]
 
-    if len(message_history[author_id]) > 5:
-        try:
-            await message.delete()
-            await message.author.timeout(timedelta(minutes=5), reason="Автоматичний захист від спаму")
-            await message.channel.send(f'⚠️ {message.author.mention} отримав мут на 5 хвилин за спам!', delete_after=5)
-        except Exception:
-            pass
+            if len(link_history[author_id]) > 3:
+                try:
+                    await message.delete()
+                    await message.channel.send(
+                        f'⚠️ {message.author.mention}, ліміт посилань перевищено! (Максимум 3 посилання на 1 хвилину)',
+                        delete_after=5
+                    )
+                    return
+                except Exception:
+                    pass
+
+    # --- ЗАХИСТ ВІД СПАМУ (для звичайних користувачів) ---
+    if not is_admin_or_mod:
+        message_history[author_id].append(now)
+        message_history[author_id] = [t for t in message_history[author_id] if now - t < timedelta(seconds=4)]
+
+        if len(message_history[author_id]) > 5:
+            try:
+                await message.delete()
+                await message.author.timeout(timedelta(minutes=5), reason="Автоматичний захист від спаму")
+                await message.channel.send(f'⚠️ {message.author.mention} отримав мут на 5 хвилин за спам!', delete_after=5)
+            except Exception:
+                pass
 
 @bot.event
 async def on_member_ban(guild, user):
