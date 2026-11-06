@@ -42,7 +42,7 @@ channel_delete_history = collections.defaultdict(list)
 
 # Бази даних активності в пам'яті бота: {user_id: count}
 user_messages = collections.defaultdict(int)
-user_voice_minutes = collections.defaultdict(int)
+user_voice_seconds = collections.defaultdict(int)
 
 # --- ID КАНАЛІВ ТА НАЛАШТУВАННЯ ---
 WELCOME_CHANNEL_ID = 1566880572029018203
@@ -65,27 +65,39 @@ REQ_VOICE_MOST = 90    # годин
 stats_message_id = None
 
 
-# --- ФОНОВА ЗАДАЧА: ПІДРАХУНОК ТА АВТОМАТИЧНА ВИДАЧА РОЛЕЙ ---
-@tasks.loop(seconds=60)
-async def activity_loop():
-    global stats_message_id
-    
-    # Вираховуємо польський час (UTC + 1 година або поточний системний із зсувом)
-    poland_time = datetime.utcnow() + timedelta(hours=1)
+# --- ДОПОМІЖНА ФУНКЦІЯ ДЛЯ ФОРМАТУВАННЯ ЧАСУ ВОЙСУ ---
+def format_voice_time(total_seconds):
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    seconds = total_seconds % 60
+    if hours > 0:
+        return f"{hours} год. {minutes} хв. {seconds} сек."
+    elif minutes > 0:
+        return f"{minutes} хв. {seconds} сек."
+    else:
+        return f"{seconds} сек."
 
-    # 1. Рахуємо хвилини у войсі для всіх активних учасників
+
+# --- ФОНОВА ЗАДАЧА: ПІДРАХУНОК СЕКУНД У ВОЙСІ ТА АВТООНОВЛЕННЯ ---
+@tasks.loop(seconds=1)
+async def voice_counter_loop():
     for guild in bot.guilds:
         for member in guild.members:
             if member.voice and member.voice.channel and not member.bot:
-                user_voice_minutes[member.id] += 1
+                user_voice_seconds[member.id] += 1
 
-        # 2. Логіка видачі/заміни ролей
+@tasks.loop(minutes=1)
+async def activity_loop():
+    global stats_message_id
+    poland_time = datetime.utcnow() + timedelta(hours=1)
+
+    for guild in bot.guilds:
         for member in guild.members:
             if member.bot:
                 continue
             
             m_count = user_messages[member.id]
-            v_hours = user_voice_minutes[member.id] / 60.0
+            v_hours = user_voice_seconds[member.id] / 3600.0
 
             r_active = guild.get_role(ROLE_ACTIVE_ID)
             r_master = guild.get_role(ROLE_MASTER_ID)
@@ -128,7 +140,7 @@ async def activity_loop():
                 except Exception:
                     pass
 
-    # 3. Автооновлення інформаційного повідомлення в статистичному каналі
+    # Автооновлення інформаційного повідомлення в статистичному каналі
     stats_channel = bot.get_channel(STATS_CHANNEL_ID)
     if stats_channel:
         embed = discord.Embed(
@@ -137,7 +149,6 @@ async def activity_loop():
             color=discord.Color.blue()
         )
         
-        # Топ-5 за повідомленнями
         top_msg = sorted(user_messages.items(), key=lambda x: x[1], reverse=True)[:5]
         msg_text = ""
         for idx, (uid, count) in enumerate(top_msg, 1):
@@ -147,14 +158,13 @@ async def activity_loop():
         
         embed.add_field(name="💬 Топ за повідомленнями", value=msg_text if msg_text else "Поки немає даних", inline=False)
 
-        # Топ-5 за часом у войсі
-        top_voice = sorted(user_voice_minutes.items(), key=lambda x: x[1], reverse=True)[:5]
+        top_voice = sorted(user_voice_seconds.items(), key=lambda x: x[1], reverse=True)[:5]
         voice_text = ""
-        for idx, (uid, mins) in enumerate(top_voice, 1):
+        for idx, (uid, secs) in enumerate(top_voice, 1):
             user_obj = bot.get_user(uid)
             name = user_obj.name if user_obj else f"ID: {uid}"
-            hours = round(mins / 60, 1)
-            voice_text += f"**{idx}.** {name} — **{hours}** год.\n"
+            time_formatted = format_voice_time(secs)
+            voice_text += f"**{idx}.** {name} — **{time_formatted}**\n"
 
         embed.add_field(name="🎙️ Топ за часом у войсі", value=voice_text if voice_text else "Поки немає даних", inline=False)
         embed.set_footer(text=f"Останнє оновлення (Польща): {poland_time.strftime('%H:%M:%S')}")
@@ -179,8 +189,42 @@ async def activity_loop():
         except Exception as e:
             print(f"Помилка оновлення статистики: {e}")
 
+
+# --- ЩОТИЖНЕВИЙ ЗВІТ КОЖНОЇ НЕДІЛІ О 23:00 ---
+@tasks.loop(minutes=1)
+async def weekly_report_loop():
+    poland_time = datetime.utcnow() + timedelta(hours=1)
+    if poland_time.weekday() == 6 and poland_time.hour == 23 and poland_time.minute == 0:
+        stats_channel = bot.get_channel(STATS_CHANNEL_ID)
+        if stats_channel:
+            embed = discord.Embed(
+                title="🏆 ПІДСУМКОВИЙ ТИЖНЕВИЙ ЗВІТ АКТИВНОСТІ",
+                description="Офіційні підсумки активності гравців за весь тиждень (неділя, 23:00)",
+                color=discord.Color.gold()
+            )
+            
+            top_msg = sorted(user_messages.items(), key=lambda x: x[1], reverse=True)[:5]
+            msg_text = "\n".join([f"**{i+1}.** <@{uid}> — **{cnt}** пов." for i, (uid, cnt) in enumerate(top_msg)])
+            embed.add_field(name="💬 Найактивніші в чаті", value=msg_text if msg_text else "Немає даних", inline=False)
+
+            top_voice = sorted(user_voice_seconds.items(), key=lambda x: x[1], reverse=True)[:5]
+            voice_text = "\n".join([f"**{i+1}.** <@{uid}> — **{format_voice_time(secs)}**" for i, (uid, secs) in enumerate(top_voice)])
+            embed.add_field(name="🎙️ Найактивніші у войсі", value=voice_text if voice_text else "Немає даних", inline=False)
+
+            embed.set_footer(text="ELITE RP | Тижневий звіт")
+            await stats_channel.send(embed=embed)
+
+
 @activity_loop.before_loop
 async def before_activity_loop():
+    await bot.wait_until_ready()
+
+@voice_counter_loop.before_loop
+async def before_voice_loop():
+    await bot.wait_until_ready()
+
+@weekly_report_loop.before_loop
+async def before_weekly_loop():
     await bot.wait_until_ready()
 
 
@@ -205,8 +249,12 @@ async def on_member_join(member: discord.Member):
 @bot.event
 async def on_ready():
     print(f'Бот успішно увійшов в систему як {bot.user} і охороняє сервер!')
+    if not voice_counter_loop.is_running():
+        voice_counter_loop.start()
     if not activity_loop.is_running():
         activity_loop.start()
+    if not weekly_report_loop.is_running():
+        weekly_report_loop.start()
     try:
         synced = await bot.tree.sync()
         print(f'Синхронізовано слеш-команд: {len(synced)}')
@@ -272,7 +320,7 @@ async def on_message(message):
                 pass
 
 
-# --- ТЕКСТОВА КОМАНДА !ранг (Оновлений дизайн у стилі картки рівня) ---
+# --- ТЕКСТОВА КОМАНДА !ранг (З відображенням персонального часу гравця через Discord Timestamps) ---
 @bot.command(name="ранг")
 async def text_rank(ctx):
     if ctx.channel.id != RANK_CHANNEL_ID:
@@ -285,14 +333,17 @@ async def text_rank(ctx):
 
     user_id = ctx.author.id
     m_count = user_messages[user_id]
-    v_hours = round(user_voice_minutes[user_id] / 60, 1)
+    v_secs = user_voice_seconds[user_id]
+    v_hours_float = v_secs / 3600.0
 
-    # Розрахунок заповненості шкали для красивого відображення (у відсотках до мети)
     msg_progress = min(int((m_count / REQ_MSG_MASTER) * 10), 10)
     msg_bar = "█" * msg_progress + "░" * (10 - msg_progress)
 
-    voice_progress = min(int((v_hours / REQ_VOICE_ACTIVE) * 10), 10)
+    voice_progress = min(int((v_hours_float / REQ_VOICE_ACTIVE) * 10), 10)
     voice_bar = "█" * voice_progress + "░" * (10 - voice_progress)
+
+    # Генерація персонального часу у вигляді інтерактивного Discord часу (автоматично підлаштовується під часову зону користувача)
+    current_timestamp = int(datetime.utcnow().timestamp())
 
     embed = discord.Embed(
         title=f"💳 Картка рангу — {ctx.author.name}",
@@ -307,7 +358,7 @@ async def text_rank(ctx):
     )
     embed.add_field(
         name="🎙️ Час у войсі", 
-        value=f"**{v_hours}** год. / {REQ_VOICE_ACTIVE} год. (Активний)\n`{voice_bar}`", 
+        value=f"**{format_voice_time(v_secs)}** / {REQ_VOICE_ACTIVE} год. (Активний)\n`{voice_bar}`", 
         inline=False
     )
     
@@ -323,12 +374,14 @@ async def text_rank(ctx):
             status_list.append("🔥 Неймовірний")
 
     embed.add_field(name="🏆 Поточні статуси", value=", ".join(status_list) if status_list else "Ще немає досягнень", inline=False)
-    embed.set_footer(text="ELITE RP | Система активності та рангів")
+    # Використання мітки часу Discord, яка автоматично відображає локальний час для кожного гравця
+    embed.set_footer(text=f"ELITE RP | Ваш локальний час: <t:{current_timestamp}:T>")
 
-    await ctx.send(embed=embed)
+    # Надіслати з текстом або відформатованим чистим embed
+    await ctx.send(content=f"🕒 Поточний час для {ctx.author.mention}: <t:{current_timestamp}:T> (<t:{current_timestamp}:D>)", embed=embed)
 
 
-# --- ТЕКСТОВА КОМАНДА !сервер (Вся інформація про сервер) ---
+# --- ТЕКСТОВА КОМАНДА !сервер ---
 @bot.command(name="сервер")
 async def text_server(ctx):
     guild = ctx.guild
