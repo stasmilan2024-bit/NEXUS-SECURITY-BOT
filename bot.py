@@ -69,7 +69,9 @@ stats_message_id = None
 @tasks.loop(seconds=60)
 async def activity_loop():
     global stats_message_id
-    now = datetime.now()
+    
+    # Вираховуємо польський час (UTC + 1 година або поточний системний із зсувом)
+    poland_time = datetime.utcnow() + timedelta(hours=1)
 
     # 1. Рахуємо хвилини у войсі для всіх активних учасників
     for guild in bot.guilds:
@@ -77,7 +79,7 @@ async def activity_loop():
             if member.voice and member.voice.channel and not member.bot:
                 user_voice_minutes[member.id] += 1
 
-        # 2. Логіка видачі/заміни ролей на основі критеріїв
+        # 2. Логіка видачі/заміни ролей
         for member in guild.members:
             if member.bot:
                 continue
@@ -85,7 +87,6 @@ async def activity_loop():
             m_count = user_messages[member.id]
             v_hours = user_voice_minutes[member.id] / 60.0
 
-            # Отримуємо об'єкти ролей за їх ID
             r_active = guild.get_role(ROLE_ACTIVE_ID)
             r_master = guild.get_role(ROLE_MASTER_ID)
             r_incredible = guild.get_role(ROLE_INCREDIBLE_ID)
@@ -95,31 +96,29 @@ async def activity_loop():
             if m_count >= REQ_MSG_MOST and v_hours >= REQ_VOICE_MOST:
                 if r_most_active and r_most_active not in member.roles:
                     try:
-                        # Додаємо вищу роль і забираємо всі попередні
                         roles_to_remove = [r for r in [r_active, r_master, r_incredible] if r in member.roles]
                         if roles_to_remove:
                             await member.remove_roles(*roles_to_remove)
                         await member.add_roles(r_most_active)
                     except Exception:
                         pass
-                continue  # Пропускаємо інші перевірки, оскільки гравець вже на максимальному рівні
+                continue
 
-            # Якщо ще немає Найактивнішого, перевіряємо звичайні ролі:
-            # Умова для Майстра (повідомлення)
+            # Майстер
             if m_count >= REQ_MSG_MASTER and r_master and r_master not in member.roles:
                 try:
                     await member.add_roles(r_master)
                 except Exception:
                     pass
 
-            # Умова для Активного (години у войсі)
+            # Активний
             if v_hours >= REQ_VOICE_ACTIVE and r_active and r_active not in member.roles:
                 try:
                     await member.add_roles(r_active)
                 except Exception:
                     pass
 
-            # Умова для Неймовірного (якщо є і Майстер, і Активний)
+            # Неймовірний
             has_master = r_master in member.roles if r_master else False
             has_active = r_active in member.roles if r_active else False
 
@@ -158,7 +157,7 @@ async def activity_loop():
             voice_text += f"**{idx}.** {name} — **{hours}** год.\n"
 
         embed.add_field(name="🎙️ Топ за часом у войсі", value=voice_text if voice_text else "Поки немає даних", inline=False)
-        embed.set_footer(text=f"Останнє оновлення: {now.strftime('%H:%M:%S')}")
+        embed.set_footer(text=f"Останнє оновлення (Польща): {poland_time.strftime('%H:%M:%S')}")
 
         try:
             if stats_message_id:
@@ -203,7 +202,6 @@ async def on_member_join(member: discord.Member):
         embed.set_footer(text="ELITE RP | Система безпеки")
         await channel.send(content=f"{member.mention}", embed=embed)
 
-# --- ПОДІЇ БОТА ---
 @bot.event
 async def on_ready():
     print(f'Бот успішно увійшов в систему як {bot.user} і охороняє сервер!')
@@ -224,7 +222,6 @@ async def on_message(message):
     now = datetime.now()
     perms = message.author.guild_permissions
 
-    # Рахуємо повідомлення для системи активності
     user_messages[author_id] += 1
 
     is_admin_or_mod = (
@@ -237,7 +234,6 @@ async def on_message(message):
     url_pattern = r'(https?://[^\s]+|www\.[^\s]+|discord\.gg/[^\s]+)'
     has_link = bool(re.search(url_pattern, message.content))
 
-    # --- ОБРОБКА ПОСИЛАНЬ ---
     if has_link:
         if not is_admin_or_mod:
             try:
@@ -263,7 +259,6 @@ async def on_message(message):
 
     await bot.process_commands(message)
 
-    # --- ЗАХИСТ ВІД СПАМУ ---
     if not is_admin_or_mod:
         message_history[author_id].append(now)
         message_history[author_id] = [t for t in message_history[author_id] if now - t < timedelta(seconds=4)]
@@ -276,7 +271,8 @@ async def on_message(message):
             except Exception:
                 pass
 
-# --- ТЕКСТОВА КОМАНДА !ранг ---
+
+# --- ТЕКСТОВА КОМАНДА !ранг (Оновлений дизайн у стилі картки рівня) ---
 @bot.command(name="ранг")
 async def text_rank(ctx):
     if ctx.channel.id != RANK_CHANNEL_ID:
@@ -291,15 +287,30 @@ async def text_rank(ctx):
     m_count = user_messages[user_id]
     v_hours = round(user_voice_minutes[user_id] / 60, 1)
 
+    # Розрахунок заповненості шкали для красивого відображення (у відсотках до мети)
+    msg_progress = min(int((m_count / REQ_MSG_MASTER) * 10), 10)
+    msg_bar = "█" * msg_progress + "░" * (10 - msg_progress)
+
+    voice_progress = min(int((v_hours / REQ_VOICE_ACTIVE) * 10), 10)
+    voice_bar = "█" * voice_progress + "░" * (10 - voice_progress)
+
     embed = discord.Embed(
-        title=f"📊 Ваш ранг та активність — {ctx.author.name}",
-        color=discord.Color.green()
+        title=f"💳 Картка рангу — {ctx.author.name}",
+        color=discord.Color.dark_theme()
     )
     embed.set_thumbnail(url=ctx.author.display_avatar.url)
-    embed.add_field(name="💬 Повідомлень у чаті", value=f"**{m_count}** / {REQ_MSG_MASTER} (Майстер) | {REQ_MSG_MOST} (Найактивніший)", inline=False)
-    embed.add_field(name="🎙️ Час у войсі", value=f"**{v_hours}** год. / {REQ_VOICE_ACTIVE} год. (Активний) | {REQ_VOICE_MOST} год. (Найактивніший)", inline=False)
     
-    # Визначаємо поточні ролі/статуси користувача
+    embed.add_field(
+        name="💬 Повідомлення в чаті", 
+        value=f"**{m_count}** / {REQ_MSG_MASTER} (Майстер)\n`{msg_bar}`", 
+        inline=False
+    )
+    embed.add_field(
+        name="🎙️ Час у войсі", 
+        value=f"**{v_hours}** год. / {REQ_VOICE_ACTIVE} год. (Активний)\n`{voice_bar}`", 
+        inline=False
+    )
+    
     status_list = []
     if any(r.id == ROLE_MOST_ACTIVE_ID for r in ctx.author.roles):
         status_list.append("👑 Найактивніший")
@@ -311,9 +322,36 @@ async def text_rank(ctx):
         if any(r.id == ROLE_INCREDIBLE_ID for r in ctx.author.roles):
             status_list.append("🔥 Неймовірний")
 
-    embed.add_field(name="🏆 Наявні статуси", value=", ".join(status_list) if status_list else "Ще немає досягнень", inline=False)
-    embed.set_footer(text="ELITE RP | Система активності")
+    embed.add_field(name="🏆 Поточні статуси", value=", ".join(status_list) if status_list else "Ще немає досягнень", inline=False)
+    embed.set_footer(text="ELITE RP | Система активності та рангів")
 
+    await ctx.send(embed=embed)
+
+
+# --- ТЕКСТОВА КОМАНДА !сервер (Вся інформація про сервер) ---
+@bot.command(name="сервер")
+async def text_server(ctx):
+    guild = ctx.guild
+    
+    embed = discord.Embed(
+        title=f"📌 Інформація про сервер: {guild.name}",
+        color=discord.Color.gold()
+    )
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+        
+    created_at = guild.created_at.strftime("%d.%m.%Y о %H:%M")
+    
+    embed.add_field(name="👑 Власник сервера", value=guild.owner.mention if guild.owner else "Невідомо", inline=True)
+    embed.add_field(name="👥 Учасників", value=f"**{guild.member_count}**", inline=True)
+    embed.add_field(name="📅 Дата створення", value=created_at, inline=False)
+    embed.add_field(name="💬 Текстові канали", value=str(len(guild.text_channels)), inline=True)
+    embed.add_field(name="🔊 Голосові канали", value=str(len(guild.voice_channels)), inline=True)
+    embed.add_field(name="🛡️ Ролей на сервері", value=str(len(guild.roles)), inline=True)
+    embed.add_field(name="🚀 Рівень бусту", value=f"Рівень {guild.premium_tier} (Бустів: {guild.premium_subscription_count})", inline=False)
+    
+    embed.set_footer(text="ELITE RP | Офіційна інформаційна система")
+    
     await ctx.send(embed=embed)
 
 
@@ -369,7 +407,8 @@ async def slash_help(interaction: discord.Interaction):
     embed.add_field(name="`/ban [@користувач]`", value="Забанити користувача на сервері", inline=False)
     embed.add_field(name="`/say [канал] [заголовок] [текст]`", value="Надіслати оголошення від імені бота", inline=False)
     embed.add_field(name="`/форум` або `!форум`", value="Отримати посилання на форум", inline=False)
-    embed.add_field(name="`!ранг`", value="Перевірити свій ранг та активність (у спец. каналі)", inline=False)
+    embed.add_field(name="`!ранг`", value="Перевірити свій ранг та прогрес (у спец. каналі)", inline=False)
+    embed.add_field(name="`!сервер`", value="Отримати всю інформацію про сервер", inline=False)
     embed.add_field(name="`/poll [питання]`", value="Створити опитування з реакціями", inline=False)
     embed.add_field(name="`/roll [макс_число]`", value="Кинути випадкове число (кубик)", inline=False)
     embed.set_footer(text="ELITE RP | Система безпеки")
