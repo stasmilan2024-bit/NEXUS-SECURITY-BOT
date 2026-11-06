@@ -1,5 +1,6 @@
 import os
 import re
+import random
 import threading
 import collections
 from datetime import datetime, timedelta
@@ -91,7 +92,6 @@ async def on_message(message):
     # --- ОБРОБКА ПОСИЛАНЬ ---
     if has_link:
         if not is_admin_or_mod:
-            # Ззвичайним користувачам заборонено будь-які посилання
             try:
                 await message.delete()
                 await message.channel.send(f'{message.author.mention}, посилання суворо заборонені на сервері!', delete_after=5)
@@ -99,7 +99,6 @@ async def on_message(message):
             except Exception:
                 pass
         else:
-            # Для адміністрації: ліміт 3 посилання на 1 хвилину (60 сек)
             link_history[author_id].append(now)
             link_history[author_id] = [t for t in link_history[author_id] if now - t < timedelta(seconds=60)]
 
@@ -114,10 +113,9 @@ async def on_message(message):
                 except Exception:
                     pass
 
-    # Обробка стандартних префіксних команд (наприклад, !forum)
     await bot.process_commands(message)
 
-    # --- ЗАХИСТ ВІД СПАМУ (для звичайних користувачів) ---
+    # --- ЗАХИСТ ВІД СПАМУ ---
     if not is_admin_or_mod:
         message_history[author_id].append(now)
         message_history[author_id] = [t for t in message_history[author_id] if now - t < timedelta(seconds=4)]
@@ -174,14 +172,16 @@ async def on_guild_channel_delete(channel):
 # --- СЛЕШ-КОМАНДИ МОДЕРАЦІЇ ТА ІНФОРМАЦІЇ ---
 @bot.tree.command(name="help", description="Показати список команд модерації та безпеки")
 async def slash_help(interaction: discord.Interaction):
-    embed = discord.Embed(title="📜 Меню команд модерації та безпеки", color=discord.Color.blue())
+    embed = discord.Embed(title="📜 Меню команд модерації та розваг", color=discord.Color.blue())
     embed.add_field(name="`/clear [кількість]`", value="Очистити чат від повідомлень", inline=False)
     embed.add_field(name="`/mute [@користувач]`", value="Дати мут користувачу на 10 хвилин", inline=False)
     embed.add_field(name="`/unmute [@користувач]`", value="Зняти мут з користувача", inline=False)
     embed.add_field(name="`/kick [@користувач]`", value="Вигнати користувача з сервера", inline=False)
     embed.add_field(name="`/ban [@користувач]`", value="Забанити користувача на сервері", inline=False)
-    embed.add_field(name="`/say [канал] [заголовок] [текст]`", value="Надіслати красиве оголошення від імені бота", inline=False)
-    embed.add_field(name="`/forum` або `!forum`", value="Отримати посилання на форум", inline=False)
+    embed.add_field(name="`/say [канал] [заголовок] [текст]`", value="Надіслати оголошення від імені бота", inline=False)
+    embed.add_field(name="`/форум` або `!форум`", value="Отримати посилання на форум", inline=False)
+    embed.add_field(name="`/poll [питання]`", value="Створити опитування з реакціями", inline=False)
+    embed.add_field(name="`/roll [макс_число]`", value="Кинути випадкове число (кубик)", inline=False)
     embed.set_footer(text="ELITE RP | Система безпеки")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -263,8 +263,39 @@ async def slash_say(
     except Exception as e:
         await interaction.response.send_message(f"❌ Помилка при відправці: {e}", ephemeral=True)
 
-# --- КОМАНДА ДЛЯ ПОСИЛАННЯ НА ФОРУМ ---
-@bot.tree.command(name="forum", description="Отримати посилання на офіційний форум ELITE RP")
+@bot.tree.command(name="poll", description="Створити голосування для гравців")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(question="Питання для голосування")
+async def slash_poll(interaction: discord.Interaction, question: str):
+    embed = discord.Embed(
+        title="📊 Офіційне голосування",
+        description=question,
+        color=discord.Color.gold()
+    )
+    embed.set_footer(text="ELITE RP | Опитування спільноти")
+
+    await interaction.response.send_message("✅ Голосування створено!", ephemeral=True)
+    message = await interaction.channel.send(embed=embed)
+    await message.add_reaction("👍")
+    await message.add_reaction("👎")
+
+@bot.tree.command(name="roll", description="Кинути кубик (випадкове число)")
+@app_commands.describe(max_num="Максимальне число (за замовчуванням 100)")
+async def slash_roll(interaction: discord.Interaction, max_num: int = 100):
+    if max_num < 1:
+        await interaction.response.send_message("❌ Число повинно бути більше 0!", ephemeral=True)
+        return
+
+    result = random.randint(1, max_num)
+    embed = discord.Embed(
+        title="🎲 Кидок кубика",
+        description=f"{interaction.user.mention} викинув число **{result}** (з {max_num})!",
+        color=discord.Color.purple()
+    )
+    await interaction.response.send_message(embed=embed)
+
+# --- КОМАНДА ДЛЯ ПОСИЛАННЯ НА ФОРУМ (Слеш /форум та текстова !форум) ---
+@bot.tree.command(name="форум", description="Отримати посилання на офіційний форум ELITE RP")
 async def slash_forum(interaction: discord.Interaction):
     view = discord.ui.View()
     forum_button = discord.ui.Button(
@@ -283,7 +314,7 @@ async def slash_forum(interaction: discord.Interaction):
 
     await interaction.response.send_message(embed=embed, view=view)
 
-@bot.command(name="forum")
+@bot.command(name="форум")
 async def text_forum(ctx):
     view = discord.ui.View()
     forum_button = discord.ui.Button(
