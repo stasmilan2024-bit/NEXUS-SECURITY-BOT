@@ -259,6 +259,7 @@ async def slash_say(
     
     try:
         await channel.send(content=content_text, embed=embed)
+        # Відповідь буде виведена приватно (ephemeral=True), тобто видима лише адміну, який викликав команду
         await interaction.response.send_message("✅ Оголошення успішно надіслано!", ephemeral=True)
     except Exception as e:
         await interaction.response.send_message(f"❌ Помилка при відправці: {e}", ephemeral=True)
@@ -292,9 +293,10 @@ async def slash_roll(interaction: discord.Interaction, max_num: int = 100):
         description=f"{interaction.user.mention} викинув число **{result}** (з {max_num})!",
         color=discord.Color.purple()
     )
-    await interaction.response.send_message(embed=embed)
+    # Зроблено ephemeral=True, щоб результат ролу бачив лише той, хто кидав кубик (або можна прибрати, якщо хочете публічно)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# --- КОМАНДА ДЛЯ ПОСИЛАННЯ НА ФОРУМ (Слеш /форум та текстова !форум) ---
+# --- КОМАНДА ДЛЯ ПОСИЛАННЯ НА ФОРУМ (З автовидаленням) ---
 @bot.tree.command(name="форум", description="Отримати посилання на офіційний форум ELITE RP")
 async def slash_forum(interaction: discord.Interaction):
     view = discord.ui.View()
@@ -312,7 +314,7 @@ async def slash_forum(interaction: discord.Interaction):
     )
     embed.set_footer(text="ELITE RP | Інформаційна система")
 
-    await interaction.response.send_message(embed=embed, view=view)
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 @bot.command(name="форум")
 async def text_forum(ctx):
@@ -331,7 +333,14 @@ async def text_forum(ctx):
     )
     embed.set_footer(text="ELITE RP | Інформаційна система")
 
-    await ctx.send(embed=embed, view=view)
+    # Видаляємо повідомлення користувача з командою
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+
+    # Відправляємо повідомлення і видаляємо його через 5 секунд
+    await ctx.send(embed=embed, view=view, delete_after=5)
 
 # --- ЗАПУСК БОТА ---
 if __name__ == '__main__':
