@@ -43,35 +43,41 @@ channel_delete_history = collections.defaultdict(list)
 # Бази даних активності в пам'яті бота: {user_id: count}
 user_messages = collections.defaultdict(int)
 user_voice_minutes = collections.defaultdict(int)
-# Відстеження часу входу у войс: {user_id: datetime}
-voice_join_times = {}
 
 # --- ID КАНАЛІВ ТА НАЛАШТУВАННЯ ---
 WELCOME_CHANNEL_ID = 1566880572029018203
 STATS_CHANNEL_ID = 1568373943138787349  # Канал куди бот оновлює статистику
-RANK_CHANNEL_ID = 1405600879587098644    # Канал де працює команда !rank
+RANK_CHANNEL_ID = 1405600879587098644    # Канал де працює команда !ранг
 
-# Налаштування лімітів для ролей
-REQUIRED_MESSAGES = 5000  # Для ролі "Майстер"
-REQUIRED_VOICE_HOURS = 50 # Для ролі "Активний" (50 годин)
+# --- ID РОЛЕЙ ---
+ROLE_ACTIVE_ID = 1405600607427100854      # Активний (50 годин)
+ROLE_MASTER_ID = 1405600608576213002      # Майстер (5000 повідомлень)
+ROLE_INCREDIBLE_ID = 1405600522010103949  # Неймовірний (обидві умови)
+ROLE_MOST_ACTIVE_ID = 1405600525826920568 # Найактивніший (90 годин і 6000 повідомлень)
 
-# Змінна для зберігання ID повідомлення зі статистикою, щоб його оновлювати
+# Пороги для ролей
+REQ_MSG_MASTER = 5000
+REQ_VOICE_ACTIVE = 50  # годин
+REQ_MSG_MOST = 6000
+REQ_VOICE_MOST = 90    # годин
+
+# Змінна для зберігання ID повідомлення зі статистикою
 stats_message_id = None
 
 
-# --- ФОНОВА ЗАДАЧА: ПІДРАХУНОК ВОЙСУ ТА ОНОВЛЕННЯ СТАТИСТИКИ ---
+# --- ФОНОВА ЗАДАЧА: ПІДРАХУНОК ТА АВТОМАТИЧНА ВИДАЧА РОЛЕЙ ---
 @tasks.loop(seconds=60)
 async def activity_loop():
     global stats_message_id
     now = datetime.now()
 
-    # 1. Рахуємо хвилини у войсі для всіх, хто зараз сидить у голосових каналах
+    # 1. Рахуємо хвилини у войсі для всіх активних учасників
     for guild in bot.guilds:
         for member in guild.members:
             if member.voice and member.voice.channel and not member.bot:
                 user_voice_minutes[member.id] += 1
 
-        # 2. Перевірка та видача ролей на основі умов
+        # 2. Логіка видачі/заміни ролей на основі критеріїв
         for member in guild.members:
             if member.bot:
                 continue
@@ -79,36 +85,47 @@ async def activity_loop():
             m_count = user_messages[member.id]
             v_hours = user_voice_minutes[member.id] / 60.0
 
-            # Шукаємо ролі на сервері за назвами
-            role_master = discord.utils.get(guild.roles, name="Майстер")
-            role_active = discord.utils.get(guild.roles, name="Активний")
-            role_incredible = discord.utils.get(guild.roles, name="Неймовірний")
+            # Отримуємо об'єкти ролей за їх ID
+            r_active = guild.get_role(ROLE_ACTIVE_ID)
+            r_master = guild.get_role(ROLE_MASTER_ID)
+            r_incredible = guild.get_role(ROLE_INCREDIBLE_ID)
+            r_most_active = guild.get_role(ROLE_MOST_ACTIVE_ID)
 
-            has_master = role_master in member.roles
-            has_active = role_active in member.roles
-            has_incredible = role_incredible in member.roles
+            # Перевірка на вищу роль "Найактивніший" (90 годин і 6000 повідомлень)
+            if m_count >= REQ_MSG_MOST and v_hours >= REQ_VOICE_MOST:
+                if r_most_active and r_most_active not in member.roles:
+                    try:
+                        # Додаємо вищу роль і забираємо всі попередні
+                        roles_to_remove = [r for r in [r_active, r_master, r_incredible] if r in member.roles]
+                        if roles_to_remove:
+                            await member.remove_roles(*roles_to_remove)
+                        await member.add_roles(r_most_active)
+                    except Exception:
+                        pass
+                continue  # Пропускаємо інші перевірки, оскільки гравець вже на максимальному рівні
 
+            # Якщо ще немає Найактивнішого, перевіряємо звичайні ролі:
             # Умова для Майстра (повідомлення)
-            if m_count >= REQUIRED_MESSAGES and role_master and not has_master:
+            if m_count >= REQ_MSG_MASTER and r_master and r_master not in member.roles:
                 try:
-                    await member.add_roles(role_master)
+                    await member.add_roles(r_master)
                 except Exception:
                     pass
 
-            # Умова для Активного (гойдини у войсі)
-            if v_hours >= REQUIRED_VOICE_HOURS and role_active and not has_active:
+            # Умова для Активного (години у войсі)
+            if v_hours >= REQ_VOICE_ACTIVE and r_active and r_active not in member.roles:
                 try:
-                    await member.add_roles(role_active)
+                    await member.add_roles(r_active)
                 except Exception:
                     pass
 
             # Умова для Неймовірного (якщо є і Майстер, і Активний)
-            is_master_now = m_count >= REQUIRED_MESSAGES
-            is_active_now = v_hours >= REQUIRED_VOICE_HOURS
+            has_master = r_master in member.roles if r_master else False
+            has_active = r_active in member.roles if r_active else False
 
-            if is_master_now and is_active_now and role_incredible and not has_incredible:
+            if has_master and has_active and r_incredible and r_incredible not in member.roles:
                 try:
-                    await member.add_roles(role_incredible)
+                    await member.add_roles(r_incredible)
                 except Exception:
                     pass
 
@@ -117,11 +134,11 @@ async def activity_loop():
     if stats_channel:
         embed = discord.Embed(
             title="📊 Статистика активності гравців ELITE RP",
-            description="Цє повідомлення автоматично оновлюється в реальному часі.",
+            description="Це повідомлення автоматично оновлюється в реальному часі.",
             color=discord.Color.blue()
         )
         
-        # Знаходимо топ-5 за повідомленнями
+        # Топ-5 за повідомленнями
         top_msg = sorted(user_messages.items(), key=lambda x: x[1], reverse=True)[:5]
         msg_text = ""
         for idx, (uid, count) in enumerate(top_msg, 1):
@@ -129,9 +146,9 @@ async def activity_loop():
             name = user_obj.name if user_obj else f"ID: {uid}"
             msg_text += f"**{idx}.** {name} — **{count}** пов.\n"
         
-        embed.add_field(name="💬 Топ за повідомленнями (Майстри)", value=msg_text if msg_text else "Поки немає даних", inline=False)
+        embed.add_field(name="💬 Топ за повідомленнями", value=msg_text if msg_text else "Поки немає даних", inline=False)
 
-        # Знаходимо топ-5 за часом у войсі
+        # Топ-5 за часом у войсі
         top_voice = sorted(user_voice_minutes.items(), key=lambda x: x[1], reverse=True)[:5]
         voice_text = ""
         for idx, (uid, mins) in enumerate(top_voice, 1):
@@ -140,7 +157,7 @@ async def activity_loop():
             hours = round(mins / 60, 1)
             voice_text += f"**{idx}.** {name} — **{hours}** год.\n"
 
-        embed.add_field(name="🎙️ Топ за часом у войсі (Активні)", value=voice_text if voice_text else "Поки немає даних", inline=False)
+        embed.add_field(name="🎙️ Топ за часом у войсі", value=voice_text if voice_text else "Поки немає даних", inline=False)
         embed.set_footer(text=f"Останнє оновлення: {now.strftime('%H:%M:%S')}")
 
         try:
@@ -149,11 +166,9 @@ async def activity_loop():
                     msg = await stats_channel.fetch_message(stats_message_id)
                     await msg.edit(embed=embed)
                 except Exception:
-                    # Якщо повідомлення було видалене, відправляємо нове
                     msg = await stats_channel.send(embed=embed)
                     stats_message_id = msg.id
             else:
-                # Шукаємо останнє повідомлення бота в тому каналі або створюємо нове
                 async for message in stats_channel.history(limit=5):
                     if message.author == bot.user:
                         stats_message_id = message.id
@@ -209,7 +224,7 @@ async def on_message(message):
     now = datetime.now()
     perms = message.author.guild_permissions
 
-    # Збільшуємо лічильник повідомлень для системи активності
+    # Рахуємо повідомлення для системи активності
     user_messages[author_id] += 1
 
     is_admin_or_mod = (
@@ -261,16 +276,15 @@ async def on_message(message):
             except Exception:
                 pass
 
-# --- ТЕКСТОВА КОМАНДА !rank (Працює ТІЛЬКИ в каналі 1405600879587098644) ---
-@bot.command(name="rank")
+# --- ТЕКСТОВА КОМАНДА !ранг ---
+@bot.command(name="ранг")
 async def text_rank(ctx):
-    # Перевірка чи команда викликана у правильному каналі
     if ctx.channel.id != RANK_CHANNEL_ID:
         try:
             await ctx.message.delete()
         except Exception:
             pass
-        temp_msg = await ctx.send(f"❌ Команда `!rank` доступна лише у спеціальному каналі!", delete_after=4)
+        await ctx.send("❌ Ця команда доступна лише у спеціальному каналі!", delete_after=4)
         return
 
     user_id = ctx.author.id
@@ -282,28 +296,25 @@ async def text_rank(ctx):
         color=discord.Color.green()
     )
     embed.set_thumbnail(url=ctx.author.display_avatar.url)
-    embed.add_field(name="💬 Повідомлень у чаті", value=f"**{m_count}** / {REQUIRED_MESSAGES} (Роль: Майстер)", inline=False)
-    embed.add_field(name="🎙️ Час у войсі", value=f"**{v_hours}** год. / {REQUIRED_VOICE_HOURS} год. (Роль: Активний)", inline=False)
+    embed.add_field(name="💬 Повідомлень у чаті", value=f"**{m_count}** / {REQ_MSG_MASTER} (Майстер) | {REQ_MSG_MOST} (Найактивніший)", inline=False)
+    embed.add_field(name="🎙️ Час у войсі", value=f"**{v_hours}** год. / {REQ_VOICE_ACTIVE} год. (Активний) | {REQ_VOICE_MOST} год. (Найактивніший)", inline=False)
     
-    # Визначаємо поточні досягнуті статуси
+    # Визначаємо поточні ролі/статуси користувача
     status_list = []
-    if m_count >= REQUIRED_MESSAGES:
-        status_list.append("✅ Майстер")
-    if v_hours >= REQUIRED_VOICE_HOURS:
-        status_list.append("✅ Активний")
-    if m_count >= REQUIRED_MESSAGES and v_hours >= REQUIRED_VOICE_HOURS:
-        status_list.append("🔥 Неймовірний")
+    if any(r.id == ROLE_MOST_ACTIVE_ID for r in ctx.author.roles):
+        status_list.append("👑 Найактивніший")
+    else:
+        if any(r.id == ROLE_MASTER_ID for r in ctx.author.roles):
+            status_list.append("✅ Майстер")
+        if any(r.id == ROLE_ACTIVE_ID for r in ctx.author.roles):
+            status_list.append("✅ Активний")
+        if any(r.id == ROLE_INCREDIBLE_ID for r in ctx.author.roles):
+            status_list.append("🔥 Неймовірний")
 
-    embed.add_field(name="🏆 Досягнуті статуси", value=", ".join(status_list) if status_list else "Ще немає досягнень", inline=False)
+    embed.add_field(name="🏆 Наявні статуси", value=", ".join(status_list) if status_list else "Ще немає досягнень", inline=False)
     embed.set_footer(text="ELITE RP | Система активності")
 
-    # Видаляємо повідомлення користувача з командою і надсилаємо відповідь з автовидаленням через 5 секунд
-    try:
-        await ctx.message.delete()
-    except Exception:
-        pass
-
-    await ctx.send(embed=embed, delete_after=5)
+    await ctx.send(embed=embed)
 
 
 @bot.event
@@ -358,7 +369,7 @@ async def slash_help(interaction: discord.Interaction):
     embed.add_field(name="`/ban [@користувач]`", value="Забанити користувача на сервері", inline=False)
     embed.add_field(name="`/say [канал] [заголовок] [текст]`", value="Надіслати оголошення від імені бота", inline=False)
     embed.add_field(name="`/форум` або `!форум`", value="Отримати посилання на форум", inline=False)
-    embed.add_field(name="`!rank`", value="Перевірити свій ранг та активність (у спец. каналі)", inline=False)
+    embed.add_field(name="`!ранг`", value="Перевірити свій ранг та активність (у спец. каналі)", inline=False)
     embed.add_field(name="`/poll [питання]`", value="Створити опитування з реакціями", inline=False)
     embed.add_field(name="`/roll [макс_число]`", value="Кинути випадкове число (кубик)", inline=False)
     embed.set_footer(text="ELITE RP | Система безпеки")
