@@ -21,7 +21,6 @@ def run_server():
     server = HTTPServer(('0.0.0.0', 10000), SimpleHandler)
     server.serve_forever()
 
-# Запускаємо веб-сервер у окремому потоці, щоб Render бачив порт
 threading.Thread(target=run_server, daemon=True).start()
 
 # --- ІНІЦІАЛІЗАЦІЯ БОТА ---
@@ -39,6 +38,10 @@ message_history = collections.defaultdict(list)
 link_history = collections.defaultdict(list)
 ban_history = collections.defaultdict(list)
 channel_delete_history = collections.defaultdict(list)
+
+# Збереження вмісту повідомлень для захисту від спаму
+last_user_messages = collections.defaultdict(list)
+admin_spam_warnings = collections.defaultdict(int)
 
 # Бази даних активності в пам'яті бота: {user_id: count}
 user_messages = collections.defaultdict(int)
@@ -61,7 +64,6 @@ REQ_VOICE_ACTIVE = 50  # годин
 REQ_MSG_MOST = 6000
 REQ_VOICE_MOST = 90    # годин
 
-# Змінна для зберігання ID повідомлення зі статистикою
 stats_message_id = None
 
 
@@ -104,7 +106,6 @@ async def activity_loop():
             r_incredible = guild.get_role(ROLE_INCREDIBLE_ID)
             r_most_active = guild.get_role(ROLE_MOST_ACTIVE_ID)
 
-            # Перевірка на вищу роль "Найактивніший" (90 годин і 6000 повідомлень)
             if m_count >= REQ_MSG_MOST and v_hours >= REQ_VOICE_MOST:
                 if r_most_active and r_most_active not in member.roles:
                     try:
@@ -116,21 +117,18 @@ async def activity_loop():
                         pass
                 continue
 
-            # Майстер
             if m_count >= REQ_MSG_MASTER and r_master and r_master not in member.roles:
                 try:
                     await member.add_roles(r_master)
                 except Exception:
                     pass
 
-            # Активний
             if v_hours >= REQ_VOICE_ACTIVE and r_active and r_active not in member.roles:
                 try:
                     await member.add_roles(r_active)
                 except Exception:
                     pass
 
-            # Неймовірний
             has_master = r_master in member.roles if r_master else False
             has_active = r_active in member.roles if r_active else False
 
@@ -140,7 +138,6 @@ async def activity_loop():
                 except Exception:
                     pass
 
-    # Автооновлення інформаційного повідомлення в статистичному каналі
     stats_channel = bot.get_channel(STATS_CHANNEL_ID)
     if stats_channel:
         embed = discord.Embed(
@@ -190,7 +187,7 @@ async def activity_loop():
             print(f"Помилка оновлення статистики: {e}")
 
 
-# --- ЩОТИЖНЕВИЙ ЗВІТ КОЖНОЇ НЕДІЛІ О 23:00 ---
+# --- ЩОТИЖНЕВИЙ ЗВІТ КОЖНОЇ НЕДІЛІ О 23:00 З ОБНУЛЕННЯМ ---
 @tasks.loop(minutes=1)
 async def weekly_report_loop():
     poland_time = datetime.utcnow() + timedelta(hours=1)
@@ -199,7 +196,7 @@ async def weekly_report_loop():
         if stats_channel:
             embed = discord.Embed(
                 title="🏆 ПІДСУМКОВИЙ ТИЖНЕВИЙ ЗВІТ АКТИВНОСТІ",
-                description="Офіційні підсумки активності гравців за весь тиждень (неділя, 23:00)",
+                description="Офіційні підсумки активності гравців за весь тиждень (неділя, 23:00). Статистика обнулена для нового тижня!",
                 color=discord.Color.gold()
             )
             
@@ -213,6 +210,10 @@ async def weekly_report_loop():
 
             embed.set_footer(text="ELITE RP | Тижневий звіт")
             await stats_channel.send(embed=embed)
+
+            # Обнулення статистики для нового тижня
+            user_messages.clear()
+            user_voice_seconds.clear()
 
 
 @activity_loop.before_loop
@@ -244,7 +245,7 @@ async def on_member_join(member: discord.Member):
         )
         embed.set_thumbnail(url=member.display_avatar.url)
         embed.set_footer(text="ELITE RP | Система безпеки")
-        await channel.send(content=f"{member.mention}", embed=embed)
+        await channel.send(embed=embed)
 
 @bot.event
 async def on_ready():
@@ -261,6 +262,16 @@ async def on_ready():
     except Exception as e:
         print(f'Помилка синхронізації команд: {e}')
 
+# --- ВІДНІМАННЯ ПОВІДОМЛЕННЯ ПРИ ВИДАЛЕННІ ---
+@bot.event
+async def on_message_delete(message):
+    if message.author.bot or message.guild is None:
+        return
+    
+    author_id = message.author.id
+    if user_messages[author_id] > 0:
+        user_messages[author_id] -= 1
+
 @bot.event
 async def on_message(message):
     if message.author.bot or message.guild is None:
@@ -269,6 +280,7 @@ async def on_message(message):
     author_id = message.author.id
     now = datetime.now()
     perms = message.author.guild_permissions
+    is_owner = (message.author.id == message.guild.owner_id)
 
     user_messages[author_id] += 1
 
@@ -290,7 +302,7 @@ async def on_message(message):
                 return
             except Exception:
                 pass
-        else:
+        elif not is_owner:
             link_history[author_id].append(now)
             link_history[author_id] = [t for t in link_history[author_id] if now - t < timedelta(seconds=60)]
 
@@ -307,20 +319,50 @@ async def on_message(message):
 
     await bot.process_commands(message)
 
-    if not is_admin_or_mod:
+    if not is_owner:
         message_history[author_id].append(now)
         message_history[author_id] = [t for t in message_history[author_id] if now - t < timedelta(seconds=4)]
 
-        if len(message_history[author_id]) > 5:
+        last_user_messages[author_id].append(message.content.strip().lower())
+        if len(last_user_messages[author_id]) > 5:
+            last_user_messages[author_id].pop(0)
+
+        is_fast_spam = len(message_history[author_id]) > 5
+
+        is_duplicate_spam = False
+        if len(last_user_messages[author_id]) >= 3:
+            recent_msgs = last_user_messages[author_id][-3:]
+            if len(set(recent_msgs)) == 1 and len(recent_msgs[0]) > 0:
+                is_duplicate_spam = True
+
+        if is_fast_spam or is_duplicate_spam:
             try:
                 await message.delete()
-                await message.author.timeout(timedelta(minutes=5), reason="Автоматичний захист від спаму")
-                await message.channel.send(f'⚠️ {message.author.mention} отримав мут на 5 хвилин за спам!', delete_after=5)
             except Exception:
                 pass
 
+            if admin_spam_warnings[author_id] == 0:
+                admin_spam_warnings[author_id] = 1
+                try:
+                    await message.author.timeout(timedelta(minutes=10), reason="Автоматичний захист: Спам у чаті")
+                    await message.channel.send(
+                        f'🔇 {message.author.mention} отримав мут на 10 хвилин за спам! При повторній спробі спаму буде видано БАН.',
+                        delete_after=8
+                    )
+                except Exception as e:
+                    print(f"Не вдалося видати мут: {e}")
+            else:
+                try:
+                    await message.guild.ban(message.author, reason="Автоматичний анти-спам: Повторний спам")
+                    await message.channel.send(
+                        f'🔨 {message.author.mention} був ЗАБАНЕНИЙ за повторний спам!',
+                        delete_after=10
+                    )
+                except Exception as e:
+                    print(f"Не вдалося забанити: {e}")
 
-# --- ТЕКСТОВА КОМАНДА !ранг (З відображенням персонального часу гравця через Discord Timestamps) ---
+
+# --- ТЕКСТОВА КОМАНДА !ранг ---
 @bot.command(name="ранг")
 async def text_rank(ctx):
     if ctx.channel.id != RANK_CHANNEL_ID:
@@ -342,7 +384,6 @@ async def text_rank(ctx):
     voice_progress = min(int((v_hours_float / REQ_VOICE_ACTIVE) * 10), 10)
     voice_bar = "█" * voice_progress + "░" * (10 - voice_progress)
 
-    # Генерація персонального часу у вигляді інтерактивного Discord часу (автоматично підлаштовується під часову зону користувача)
     current_timestamp = int(datetime.utcnow().timestamp())
 
     embed = discord.Embed(
@@ -374,11 +415,9 @@ async def text_rank(ctx):
             status_list.append("🔥 Неймовірний")
 
     embed.add_field(name="🏆 Поточні статуси", value=", ".join(status_list) if status_list else "Ще немає досягнень", inline=False)
-    # Використання мітки часу Discord, яка автоматично відображає локальний час для кожного гравця
-    embed.set_footer(text=f"ELITE RP | Ваш локальний час: <t:{current_timestamp}:T>")
+    embed.set_footer(text=f"ELITE RP | Система активності")
 
-    # Надіслати з текстом або відформатованим чистим embed
-    await ctx.send(content=f"🕒 Поточний час для {ctx.author.mention}: <t:{current_timestamp}:T> (<t:{current_timestamp}:D>)", embed=embed)
+    await ctx.send(content=f"🕒 Ваш час: <t:{current_timestamp}:T>", embed=embed)
 
 
 # --- ТЕКСТОВА КОМАНДА !сервер ---
@@ -576,7 +615,7 @@ async def slash_roll(interaction: discord.Interaction, max_num: int = 100):
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# --- КОМАНДА ДЛЯ ПОСИЛАННЯ НА ФОРУМ (З автовидаленням) ---
+# --- КОМАНДА ДЛЯ ПОСИЛАННЯ НА ФОРУМ ---
 @bot.tree.command(name="форум", description="Отримати посилання на офіційний форум ELITE RP")
 async def slash_forum(interaction: discord.Interaction):
     view = discord.ui.View()
