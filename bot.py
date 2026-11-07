@@ -39,18 +39,31 @@ link_history = collections.defaultdict(list)
 ban_history = collections.defaultdict(list)
 channel_delete_history = collections.defaultdict(list)
 
-# Збереження вмісту повідомлень для захисту від спаму
+# Захист від спаму
 last_user_messages = collections.defaultdict(list)
 admin_spam_warnings = collections.defaultdict(int)
 
-# Бази даних активності в пам'яті бота: {user_id: count}
+# Бази даних активності в пам'яті бота
 user_messages = collections.defaultdict(int)
 user_voice_seconds = collections.defaultdict(int)
 
+# --- ЕКОНОМІКА ТА БАЛИ ---
+user_coins = collections.defaultdict(int)
+last_daily_claim = {} # {user_id: datetime}
+
 # --- ID КАНАЛІВ ТА НАЛАШТУВАННЯ ---
 WELCOME_CHANNEL_ID = 1566880572029018203
-STATS_CHANNEL_ID = 1568373943138787349  # Канал куди бот оновлює статистику
-RANK_CHANNEL_ID = 1405600879587098644    # Канал де працює команда !ранг
+STATS_CHANNEL_ID = 1568373943138787349  
+RANK_CHANNEL_ID = 1405600879587098644    
+
+# --- ПОСИЛАННЯ НА СОЦМЕРЕЖІ ---
+URL_SITE = "https://eliterp.pp.ua"                         
+URL_FORUM = "http://eliterpforum.sytes.net/index.php"       
+URL_TG_CHANNEL = "https://t.me/your_telegram_channel"       
+URL_TG_CHAT = "https://t.me/your_telegram_chat"             
+URL_TG_BOT = "🚧 В розробці"                                
+URL_TIKTOK = "https://www.tiktok.com/@your_tiktok"          
+URL_INSTAGRAM = "https://www.instagram.com/your_instagram"  
 
 # --- ID РОЛЕЙ ---
 ROLE_ACTIVE_ID = 1405600607427100854      # Активний (50 годин)
@@ -58,16 +71,22 @@ ROLE_MASTER_ID = 1405600608576213002      # Майстер (5000 повідом�
 ROLE_INCREDIBLE_ID = 1405600522010103949  # Неймовірний (обидві умови)
 ROLE_MOST_ACTIVE_ID = 1405600525826920568 # Найактивніший (90 годин і 6000 повідомлень)
 
-# Пороги для ролей
+# --- ТОВАРІ У МАГАЗИНІ {ID товару: {"name": Назва, "price": Ціна, "role_id": ID Ролі або None}} ---
+# Заміни role_id на справжні ID ролей у Discord, які купують гравці!
+SHOP_ITEMS = {
+    "1": {"name": "🎨 Роль 'Червоний Нік'", "price": 500, "role_id": None},
+    "2": {"name": "👑 Роль 'VIP Гравець'", "price": 1200, "role_id": None},
+    "3": {"name": "🔥 Роль 'Мажор'", "price": 2500, "role_id": None}
+}
+
 REQ_MSG_MASTER = 5000
-REQ_VOICE_ACTIVE = 50  # годин
+REQ_VOICE_ACTIVE = 50  
 REQ_MSG_MOST = 6000
-REQ_VOICE_MOST = 90    # годин
+REQ_VOICE_MOST = 90    
 
 stats_message_id = None
 
 
-# --- ДОПОМІЖНА ФУНКЦІЯ ДЛЯ ФОРМАТУВАННЯ ЧАСУ ВОЙСУ ---
 def format_voice_time(total_seconds):
     hours = total_seconds // 3600
     minutes = (total_seconds % 3600) // 60
@@ -80,13 +99,16 @@ def format_voice_time(total_seconds):
         return f"{seconds} сек."
 
 
-# --- ФОНОВА ЗАДАЧА: ПІДРАХУНОК СЕКУНД У ВОЙСІ ТА АВТООНОВЛЕННЯ ---
+# --- ФОНОВА ЗАДАЧА: ПІДРАХУНОК СЕКУНД ТА НАРАХУВАННЯ БАЛІВ ЗА ВОЙС ---
 @tasks.loop(seconds=1)
 async def voice_counter_loop():
     for guild in bot.guilds:
         for member in guild.members:
             if member.voice and member.voice.channel and not member.bot:
                 user_voice_seconds[member.id] += 1
+                # За кожні 300 секунд (5 хвилин) у войсі даємо +5 балів
+                if user_voice_seconds[member.id] % 300 == 0:
+                    user_coins[member.id] += 5
 
 @tasks.loop(minutes=1)
 async def activity_loop():
@@ -187,7 +209,6 @@ async def activity_loop():
             print(f"Помилка оновлення статистики: {e}")
 
 
-# --- ЩОТИЖНЕВИЙ ЗВІТ КОЖНОЇ НЕДІЛІ О 23:00 З ОБНУЛЕННЯМ ---
 @tasks.loop(minutes=1)
 async def weekly_report_loop():
     poland_time = datetime.utcnow() + timedelta(hours=1)
@@ -196,7 +217,7 @@ async def weekly_report_loop():
         if stats_channel:
             embed = discord.Embed(
                 title="🏆 ПІДСУМКОВИЙ ТИЖНЕВИЙ ЗВІТ АКТИВНОСТІ",
-                description="Офіційні підсумки активності гравців за весь тиждень (неділя, 23:00). Статистика обнулена для нового тижня!",
+                description="Офіційні підсумки активності гравців за весь тиждень (неділя, 23:00). Статистика обнулена!",
                 color=discord.Color.gold()
             )
             
@@ -211,7 +232,6 @@ async def weekly_report_loop():
             embed.set_footer(text="ELITE RP | Тижневий звіт")
             await stats_channel.send(embed=embed)
 
-            # Обнулення статистики для нового тижня
             user_messages.clear()
             user_voice_seconds.clear()
 
@@ -262,12 +282,10 @@ async def on_ready():
     except Exception as e:
         print(f'Помилка синхронізації команд: {e}')
 
-# --- ВІДНІМАННЯ ПОВІДОМЛЕННЯ ПРИ ВИДАЛЕННІ ---
 @bot.event
 async def on_message_delete(message):
     if message.author.bot or message.guild is None:
         return
-    
     author_id = message.author.id
     if user_messages[author_id] > 0:
         user_messages[author_id] -= 1
@@ -283,6 +301,8 @@ async def on_message(message):
     is_owner = (message.author.id == message.guild.owner_id)
 
     user_messages[author_id] += 1
+    # Даємо +1 бал (Coin) за кожне повідомлення у чаті!
+    user_coins[author_id] += 1
 
     is_admin_or_mod = (
         perms.administrator or 
@@ -362,7 +382,7 @@ async def on_message(message):
                     print(f"Не вдалося забанити: {e}")
 
 
-# --- ТЕКСТОВА КОМАНДА !ранг ---
+# --- ТЕКСТОВА КОМАНДА !ранг (З балансом монет) ---
 @bot.command(name="ранг")
 async def text_rank(ctx):
     if ctx.channel.id != RANK_CHANNEL_ID:
@@ -377,6 +397,7 @@ async def text_rank(ctx):
     m_count = user_messages[user_id]
     v_secs = user_voice_seconds[user_id]
     v_hours_float = v_secs / 3600.0
+    coins = user_coins[user_id]
 
     msg_progress = min(int((m_count / REQ_MSG_MASTER) * 10), 10)
     msg_bar = "█" * msg_progress + "░" * (10 - msg_progress)
@@ -392,16 +413,9 @@ async def text_rank(ctx):
     )
     embed.set_thumbnail(url=ctx.author.display_avatar.url)
     
-    embed.add_field(
-        name="💬 Повідомлення в чаті", 
-        value=f"**{m_count}** / {REQ_MSG_MASTER} (Майстер)\n`{msg_bar}`", 
-        inline=False
-    )
-    embed.add_field(
-        name="🎙️ Час у войсі", 
-        value=f"**{format_voice_time(v_secs)}** / {REQ_VOICE_ACTIVE} год. (Активний)\n`{voice_bar}`", 
-        inline=False
-    )
+    embed.add_field(name="💰 Баланс балів", value=f"**{coins}** балів (ELITE Coins)", inline=False)
+    embed.add_field(name="💬 Повідомлення в чаті", value=f"**{m_count}** / {REQ_MSG_MASTER} (Майстер)\n`{msg_bar}`", inline=False)
+    embed.add_field(name="🎙️ Час у войсі", value=f"**{format_voice_time(v_secs)}** / {REQ_VOICE_ACTIVE} год. (Активний)\n`{voice_bar}`", inline=False)
     
     status_list = []
     if any(r.id == ROLE_MOST_ACTIVE_ID for r in ctx.author.roles):
@@ -420,11 +434,123 @@ async def text_rank(ctx):
     await ctx.send(content=f"🕒 Ваш час: <t:{current_timestamp}:T>", embed=embed)
 
 
+# --- 🎁 ЩОДЕННИЙ БОНУС (!бонус / !daily) ---
+@bot.command(name="бонус", aliases=["daily"])
+async def get_daily_bonus(ctx):
+    user_id = ctx.author.id
+    now = datetime.now()
+
+    if user_id in last_daily_claim:
+        time_passed = now - last_daily_claim[user_id]
+        if time_passed < timedelta(hours=24):
+            time_left = timedelta(hours=24) - time_passed
+            hours, remainder = divmod(int(time_left.total_seconds()), 3600)
+            minutes, _ = divmod(remainder, 60)
+            await ctx.send(f"⏳ {ctx.author.mention}, ви вже забирали бонус! Наступний доступний через **{hours} год. {minutes} хв.**")
+            return
+
+    reward = random.randint(50, 150)
+    user_coins[user_id] += reward
+    last_daily_claim[user_id] = now
+    
+    embed = discord.Embed(
+        title="🎁 Щоденний бонус отримано!",
+        description=f"{ctx.author.mention}, вам заміраховано **+{reward}** балів (ELITE Coins)!\nПоточний баланс: **{user_coins[user_id]}** балів.",
+        color=discord.Color.gold()
+    )
+    await ctx.send(embed=embed)
+
+
+# --- 🎲 ДУЕЛЬ НА БАЛИ (!дуель @гравець ставка) ---
+@bot.command(name="дуель")
+async def duel_coins(ctx, opponent: discord.Member = None, bet: int = 0):
+    if not opponent or opponent.bot or opponent == ctx.author:
+        await ctx.send("❌ Вкажіть коректного гравця для дуелі! Наприклад: `!дуель @User 50`")
+        return
+    
+    if bet <= 0:
+        await ctx.send("❌ Ставка повинна бути більше 0 балів!")
+        return
+
+    if user_coins[ctx.author.id] < bet:
+        await ctx.send(f"❌ У вас недостатньо балів! Ваш баланс: **{user_coins[ctx.author.id]}** балів.")
+        return
+
+    if user_coins[opponent.id] < bet:
+        await ctx.send(f"❌ У {opponent.mention} недостатньо балів для цієї ставки!")
+        return
+
+    winner = random.choice([ctx.author, opponent])
+    loser = opponent if winner == ctx.author else ctx.author
+
+    user_coins[winner.id] += bet
+    user_coins[loser.id] -= bet
+
+    embed = discord.Embed(
+        title="🎲 Результат дуелі!",
+        description=f"⚔️ **{ctx.author.name}** зійшовся у дуелі з **{opponent.name}** на **{bet}** балів!\n\n🏆 Переможець: {winner.mention} і забирає **+{bet}** балів!",
+        color=discord.Color.purple()
+    )
+    await ctx.send(embed=embed)
+
+
+# --- 🛒 МАГАЗИН РОЛЕЙ ТА ПРИВІЛЕЇВ (!магазин / !shop) ---
+@bot.command(name="магазин", aliases=["shop"])
+async def view_shop(ctx):
+    embed = discord.Embed(
+        title="🛒 Серверний Магазин ELITE RP",
+        description="Купуйте унікальні ролі та товари за накопичені бали активності!\nЩоб купити товар, напишіть: `!купити [номер]` (наприклад: `!купити 1`)\n",
+        color=discord.Color.green()
+    )
+    
+    for item_id, info in SHOP_ITEMS.items():
+        embed.add_field(name=f"Товар #{item_id}: {info['name']}", value=f"💰 Ціна: **{info['price']}** балів", inline=False)
+        
+    embed.set_footer(text=f"Ваш поточний баланс: {user_coins[ctx.author.id]} балів | Набирайте бали у чаті та войсі!")
+    await ctx.send(embed=embed)
+
+
+# --- 🛍️ КУПІВЛЯ ТОВАРУ В МАГАЗИНІ (!купити номер) ---
+@bot.command(name="купити", aliases=["buy"])
+async def buy_item(ctx, item_id: str = None):
+    if not item_id or item_id not in SHOP_ITEMS:
+        await ctx.send("❌ Вкажіть правильний номер товару! Введіть `!магазин`, щоб подивитися товари.")
+        return
+
+    item = SHOP_ITEMS[item_id]
+    price = item["price"]
+    user_id = ctx.author.id
+
+    if user_coins[user_id] < price:
+        await ctx.send(f"❌ У вас недостатньо балів для купівлі **{item['name']}**! Потрібно **{price}** балів (у вас **{user_coins[user_id]}**).")
+        return
+
+    user_coins[user_id] -= price
+
+    # Якщо до товару прив'язано ID ролі — видаємо її
+    role_given = False
+    if item["role_id"]:
+        role = ctx.guild.get_role(item["role_id"])
+        if role:
+            try:
+                await ctx.author.add_roles(role)
+                role_given = True
+            except Exception:
+                pass
+
+    msg = f"🎉 {ctx.author.mention}, ви успішно придбали **{item['name']}** за **{price}** балів!"
+    if role_given:
+        msg += " Роль успішно видано!"
+    else:
+        msg += "\n*Адміністрація сповіщена про вашу покупку!*"
+
+    await ctx.send(msg)
+
+
 # --- ТЕКСТОВА КОМАНДА !сервер ---
 @bot.command(name="сервер")
 async def text_server(ctx):
     guild = ctx.guild
-    
     embed = discord.Embed(
         title=f"📌 Інформація про сервер: {guild.name}",
         color=discord.Color.gold()
@@ -443,8 +569,47 @@ async def text_server(ctx):
     embed.add_field(name="🚀 Рівень бусту", value=f"Рівень {guild.premium_tier} (Бустів: {guild.premium_subscription_count})", inline=False)
     
     embed.set_footer(text="ELITE RP | Офіційна інформаційна система")
-    
     await ctx.send(embed=embed)
+
+
+# --- КОМАНДИ ДЛЯ СОЦМЕРЕЖ (/links, !посилання, !соцмережі) ---
+async def send_social_links(target):
+    description_text = (
+        "🎮 **ELITE RP** — онлайн-гра про Україну! 🇺🇦\n"
+        "Приєднуйся до нашої спільноти та створюй власну історію разом із нами!\n\n"
+        f"🔷 **Сайт:** {URL_SITE}\n"
+        f"🔷 **Форум:** {URL_FORUM}\n"
+        f"📢 **Telegram-канал:** {URL_TG_CHANNEL}\n"
+        f"💬 **Telegram-чат:** {URL_TG_CHAT}\n"
+        f"🛡️ **Telegram-бот:** {URL_TG_BOT}\n"
+        f"🎵 **TikTok:** {URL_TIKTOK}\n"
+        f"📸 **Instagram:** {URL_INSTAGRAM}\n\n"
+        "🔹 Підписуйся на наші соціальні мережі, спілкуйся з учасниками та дізнавайся першим про новини, оновлення й події проєкту!"
+    )
+
+    embed = discord.Embed(
+        title="🌐 СОЦІАЛЬНІ МЕРЕЖІ | ELITE RP",
+        description=description_text,
+        color=discord.Color.blue()
+    )
+    embed.set_footer(text="ELITE RP | Офіційні посилання")
+
+    if isinstance(target, discord.Interaction):
+        await target.response.send_message(embed=embed)
+    else:
+        await target.send(embed=embed)
+
+@bot.tree.command(name="links", description="Показати всі офіційні посилання та соцмережі проєкту")
+async def slash_links(interaction: discord.Interaction):
+    await send_social_links(interaction)
+
+@bot.command(name="посилання", aliases=["соцмережі", "links"])
+async def text_links(ctx):
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+    await send_social_links(ctx)
 
 
 @bot.event
@@ -489,21 +654,19 @@ async def on_guild_channel_delete(channel):
                 print(f"Помилка захисту каналів: {e}")
 
 # --- СЛЕШ-КОМАНДИ МОДЕРАЦІЇ ТА ІНФОРМАЦІЇ ---
-@bot.tree.command(name="help", description="Показати список команд модерації та безпеки")
+@bot.tree.command(name="help", description="Показати список команд модерації та розваг")
 async def slash_help(interaction: discord.Interaction):
-    embed = discord.Embed(title="📜 Меню команд модерації та розваг", color=discord.Color.blue())
-    embed.add_field(name="`/clear [кількість]`", value="Очистити чат від повідомлень", inline=False)
-    embed.add_field(name="`/mute [@користувач]`", value="Дати мут користувачу на 10 хвилин", inline=False)
-    embed.add_field(name="`/unmute [@користувач]`", value="Зняти мут з користувача", inline=False)
-    embed.add_field(name="`/kick [@користувач]`", value="Вигнати користувача з сервера", inline=False)
-    embed.add_field(name="`/ban [@користувач]`", value="Забанити користувача на сервері", inline=False)
-    embed.add_field(name="`/say [канал] [заголовок] [текст]`", value="Надіслати оголошення від імені бота", inline=False)
-    embed.add_field(name="`/форум` або `!форум`", value="Отримати посилання на форум", inline=False)
-    embed.add_field(name="`!ранг`", value="Перевірити свій ранг та прогрес (у спец. каналі)", inline=False)
+    embed = discord.Embed(title="📜 Меню команд модерації та економіки", color=discord.Color.blue())
+    embed.add_field(name="`!бонус` або `!daily`", value="Отримати щоденні безкоштовні бали", inline=False)
+    embed.add_field(name="`!магазин` або `!shop`", value="Переглянути магазин ролей та товарів", inline=False)
+    embed.add_field(name="`!купити [номер]`", value="Купити товар у магазині", inline=False)
+    embed.add_field(name="`!дуель [@гравець] [ставка]`", value="Зіграти в дуель на бали з іншим гравцем", inline=False)
+    embed.add_field(name="`!ранг`", value="Перевірити свій ранг, баланс балів та активність", inline=False)
+    embed.add_field(name="`/links` або `!посилання`", value="Показати всі соціальні мережі проєкту", inline=False)
     embed.add_field(name="`!сервер`", value="Отримати всю інформацію про сервер", inline=False)
-    embed.add_field(name="`/poll [питання]`", value="Створити опитування з реакціями", inline=False)
-    embed.add_field(name="`/roll [макс_число]`", value="Кинути випадкове число (кубик)", inline=False)
-    embed.set_footer(text="ELITE RP | Система безпеки")
+    embed.add_field(name="`/clear [кількість]`", value="Очистити чат від повідомлень", inline=False)
+    embed.add_field(name="`/mute` / `/unmute` / `/kick` / `/ban`", value="Команди модерації", inline=False)
+    embed.set_footer(text="ELITE RP | Економічна система")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="clear", description="Очистити чат від повідомлень")
@@ -621,7 +784,7 @@ async def slash_forum(interaction: discord.Interaction):
     view = discord.ui.View()
     forum_button = discord.ui.Button(
         label="Перейти на форум", 
-        url="http://eliterpforum.sytes.net/index.php",
+        url=URL_FORUM,
         style=discord.ButtonStyle.link
     )
     view.add_item(forum_button)
@@ -640,7 +803,7 @@ async def text_forum(ctx):
     view = discord.ui.View()
     forum_button = discord.ui.Button(
         label="Перейти на форум", 
-        url="http://eliterpforum.sytes.net/index.php",
+        url=URL_FORUM,
         style=discord.ButtonStyle.link
     )
     view.add_item(forum_button)
