@@ -9,7 +9,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import discord
 from discord.ext import commands, tasks
-from discord import app_commands  # <--- ВОТ ЦЙ ІМПОРТ БУВ ПРОПУЩЕНИЙ
+from discord import app_commands
 
 # --- ВЕБ-СЕРВЕР ДЛЯ RENDER ---
 def run_server():
@@ -144,100 +144,36 @@ async def send_log(guild, title, description, color=discord.Color.blue()):
             print(f"Помилка відправки логу: {e}")
 
 
-# --- МОДАЛЬНЕ ВІКНО НАЛАШТУВАННЯ КІМНАТИ ---
-class RoomSettingsModal(discord.ui.Modal, title="Налаштування приватної кімнати"):
-    room_name = discord.ui.TextInput(
-        label="Назва вашої кімнати",
-        placeholder="Наприклад: Chill Zone",
-        max_length=50,
-        required=True
-    )
-    user_limit = discord.ui.TextInput(
-        label="Ліміт людей (0 - без обмежень)",
-        placeholder="0",
-        default="0",
-        max_length=2,
-        required=True
-    )
-
-    def __init__(self, member: discord.Member):
-        super().__init__()
-        self.member = member
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-
-        guild = interaction.guild
-        if not guild:
-            await interaction.followup.send("❌ Помилка: не вдалося визначити сервер.", ephemeral=True)
-            return
-
-        category = guild.get_channel(PRIVATE_ROOMS_CATEGORY_ID)
-        cat_obj = category if isinstance(category, discord.CategoryChannel) else None
-        
-        try:
-            limit = int(self.user_limit.value)
-            if limit < 0 or limit > 99:
-                limit = 0
-        except ValueError:
-            limit = 0
-
-        final_name = f"🔊 | {self.room_name.value}"
-
-        try:
-            new_channel = await guild.create_voice_channel(
-                name=final_name,
-                user_limit=limit,
-                category=cat_obj
-            )
-            await new_channel.set_permissions(self.member, manage_channels=True, move_members=True)
-            await self.member.move_to(new_channel)
-            active_private_channels[new_channel.id] = self.member.id
-
-            await send_log(guild, "Створення кімнати", f"Користувач {self.member.mention} створив приватний войс: **{final_name}** (ліміт: {limit})", discord.Color.green())
-            await interaction.followup.send(f"✅ Кімнату **«{final_name}»** успішно створено!", ephemeral=True)
-        except Exception as e:
-            print(f"Помилка створення каналу: {e}")
-            await interaction.followup.send(f"❌ Помилка створення каналу: {e}", ephemeral=True)
-
-
-# --- СИСТЕМА ПРИВАТНИХ ВОЙСІВ ---
+# --- НАДІЙНА СИСТЕМА ПРИВАТНИХ ВОЙСІВ (БЕЗ ПОМИЛОК ЛС) ---
 @bot.event
 async def on_voice_state_update(member, before, after):
     if member.bot:
         return
 
+    # Коли гравець заходить у канал «Створити канал»
     if after.channel and after.channel.id == CREATE_VOICE_CHANNEL_ID:
-        view = discord.ui.View(timeout=120)
-        button = discord.ui.Button(label="⚙️ Налаштувати кімнату", style=discord.ButtonStyle.green)
-
-        async def button_callback(interaction: discord.Interaction):
-            if interaction.user.id != member.id:
-                await interaction.response.send_message("❌ Це меню не для вас!", ephemeral=True)
-                return
-            await interaction.response.send_modal(RoomSettingsModal(member))
-
-        button.callback = button_callback
-        view.add_item(button)
-
+        guild = member.guild
+        category = guild.get_channel(PRIVATE_ROOMS_CATEGORY_ID)
+        cat_obj = category if isinstance(category, discord.CategoryChannel) else None
+        
+        room_name = f"🔊 | Кімната {member.name}"
         try:
-            await member.send("⚙️ Налаштуйте свою приватну кімнату ELITE RP за допомогою кнопки нижче:", view=view)
-        except Exception:
-            guild = member.guild
-            category = guild.get_channel(PRIVATE_ROOMS_CATEGORY_ID)
-            cat_obj = category if isinstance(category, discord.CategoryChannel) else None
-            try:
-                new_channel = await guild.create_voice_channel(
-                    name=f"🔊 | Кімната {member.name}",
-                    category=cat_obj
-                )
-                await new_channel.set_permissions(member, manage_channels=True, move_members=True)
-                await member.move_to(new_channel)
-                active_private_channels[new_channel.id] = member.id
-                await send_log(guild, "Створення кімнати (Авто)", f"Користувач {member.mention} створив стандартну кімнату (ЛС закриті).", discord.Color.green())
-            except Exception as ex:
-                print(f"Помилка автостворення: {ex}")
+            # Створюємо канал у потрібній категорії
+            new_channel = await guild.create_voice_channel(
+                name=room_name,
+                category=cat_obj
+            )
+            # Даємо власнику повні права керувати каналом
+            await new_channel.set_permissions(member, manage_channels=True, move_members=True)
+            # Переносимо гравця у створену кімнату
+            await member.move_to(new_channel)
+            active_private_channels[new_channel.id] = member.id
 
+            await send_log(guild, "Створення кімнати", f"Користувач {member.mention} створив приватний войс: **{room_name}**", discord.Color.green())
+        except Exception as e:
+            print(f"Помилка створення приватної кімнати: {e}")
+
+    # Автоматичне видалення порожніх приватних кімнат
     if before.channel and before.channel.id in active_private_channels:
         if len(before.channel.members) == 0:
             try:
