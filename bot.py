@@ -144,7 +144,7 @@ async def send_log(guild, title, description, color=discord.Color.blue()):
             print(f"Помилка відправки логу: {e}")
 
 
-# --- ІНТЕРАКТИВНЕ ВІКНО НАЛАШТУВАННЯ КІМНАТИ (MODAL) ---
+# --- ВИПРАВЛЕНЕ МОДАЛЬНЕ ВІКНО НАЛАШТУВАННЯ КІМНАТИ ---
 class RoomSettingsModal(discord.ui.Modal, title="Налаштування приватної кімнати"):
     room_name = discord.ui.TextInput(
         label="Назва вашої кімнати",
@@ -165,6 +165,9 @@ class RoomSettingsModal(discord.ui.Modal, title="Налаштування при
         self.member = member
 
     async def on_submit(self, interaction: discord.Interaction):
+        # 1. Одразу робимо defer, щоб уникнути помилки тайм-ауту Discord (3 секунди)
+        await interaction.response.defer(ephemeral=True)
+
         guild = interaction.guild
         category = guild.get_channel(PRIVATE_ROOMS_CATEGORY_ID)
         
@@ -188,9 +191,9 @@ class RoomSettingsModal(discord.ui.Modal, title="Налаштування при
             active_private_channels[new_channel.id] = self.member.id
 
             await send_log(guild, "Створення кімнати", f"Користувач {self.member.mention} створив приватний войс: **{final_name}**", discord.Color.green())
-            await interaction.response.send_message(f"✅ Кімнату **«{final_name}»** створено!", ephemeral=True)
+            await interaction.followup.send(f"✅ Кімнату **«{final_name}»** успішно створено!", ephemeral=True)
         except Exception as e:
-            await interaction.response.send_message(f"❌ Помилка: {e}", ephemeral=True)
+            await interaction.followup.send(f"❌ Помилка створення каналу: {e}", ephemeral=True)
 
 
 # --- СИСТЕМА ПРИВАТНИХ ВОЙСІВ ---
