@@ -82,7 +82,7 @@ last_daily_claim = {}
 WELCOME_CHANNEL_ID = 1566880572029018203
 STATS_CHANNEL_ID = 1568373943138787349  
 RANK_CHANNEL_ID = 1405600879587098644    
-LOG_CHANNEL_ID = 1569067419740278936    
+LOG_CHANNEL_ID = 1569067419740278936    # Канал для логування дій
 
 # ID для приватних войсів
 CREATE_VOICE_CHANNEL_ID = 1405601386674130965
@@ -144,34 +144,79 @@ async def send_log(guild, title, description, color=discord.Color.blue()):
             print(f"Помилка відправки логу: {e}")
 
 
-# --- НАДІЙНА СИСТЕМА ПРИВАТНИХ ВОЙСІВ (БЕЗ ПОМИЛОК ЛС) ---
+# --- РОЗШИРЕНІ ПОДІЇ ЛОГУВАННЯ ---
+
+# 1. Лог видалення повідомлень
+@bot.event
+async def on_message_delete(message):
+    if message.author.bot or message.guild is None:
+        return
+    
+    # Коригуємо лічильник повідомлень в статистиці
+    author_id = message.author.id
+    if user_messages[author_id] > 0:
+        user_messages[author_id] -= 1
+        save_data()
+
+    content = message.content if message.content else "*[Медіафайл / Вкладення]*"
+    desc = f"**Автор:** {message.author.mention}\n**Канал:** {message.channel.mention}\n**Повідомлення:** {content}"
+    await send_log(message.guild, "Видалення повідомлення", desc, discord.Color.orange())
+
+
+# 2. Лог видачі/зняття ролей та зміни нікнеймів
+@bot.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+    guild = after.guild
+
+    # Перевірка на зміну ролей
+    if before.roles != after.roles:
+        added_roles = [r for r in after.roles if r not in before.roles]
+        removed_roles = [r for r in before.roles if r not in after.roles]
+
+        for role in added_roles:
+            await send_log(guild, "Видача ролі", f"Користувачу {after.mention} видано роль **{role.name}**.", discord.Color.green())
+        
+        for role in removed_roles:
+            await send_log(guild, "Зняття ролі", f"З користувача {after.mention} знято роль **{role.name}**.", discord.Color.red())
+
+    # Перевірка на зміну нікнейма
+    if before.nick != after.nick:
+        old_nick = before.nick or before.name
+        new_nick = after.nick or after.name
+        await send_log(guild, "Зміна нікнейма", f"Користувач {after.mention} змінив нікнейм:\nСтарий: `{old_nick}`\nНовий: `{new_nick}`", discord.Color.purple())
+
+
+# 3. Лог переходів у голосові канали (вхід, вихід, переміщення)
 @bot.event
 async def on_voice_state_update(member, before, after):
     if member.bot:
         return
 
-    # Коли гравець заходить у канал «Створити канал»
+    guild = member.guild
+
+    # Логіка створення приватних кімнат
     if after.channel and after.channel.id == CREATE_VOICE_CHANNEL_ID:
-        guild = member.guild
         category = guild.get_channel(PRIVATE_ROOMS_CATEGORY_ID)
         cat_obj = category if isinstance(category, discord.CategoryChannel) else None
         
         room_name = f"🔊 | Кімната {member.name}"
         try:
-            # Створюємо канал у потрібній категорії
-            new_channel = await guild.create_voice_channel(
-                name=room_name,
-                category=cat_obj
-            )
-            # Даємо власнику повні права керувати каналом
+            new_channel = await guild.create_voice_channel(name=room_name, category=cat_obj)
             await new_channel.set_permissions(member, manage_channels=True, move_members=True)
-            # Переносимо гравця у створену кімнату
             await member.move_to(new_channel)
             active_private_channels[new_channel.id] = member.id
-
             await send_log(guild, "Створення кімнати", f"Користувач {member.mention} створив приватний войс: **{room_name}**", discord.Color.green())
         except Exception as e:
             print(f"Помилка створення приватної кімнати: {e}")
+
+    # Логування звичайних переміщень у войсі
+    if before.channel != after.channel:
+        if before.channel is None and after.channel is not None:
+            await send_log(guild, "Вхід у войс", f"Користувач {member.mention} зайшов у голосовий канал **{after.channel.name}**.", discord.Color.blue())
+        elif before.channel is not None and after.channel is None:
+            await send_log(guild, "Вихід з войсу", f"Користувач {member.mention} вийшов із голосового каналу **{before.channel.name}**.", discord.Color.blue())
+        elif before.channel is not None and after.channel is not None:
+            await send_log(guild, "Переміщення у войсі", f"Користувач {member.mention} перейшов з **{before.channel.name}** у **{after.channel.name}**.", discord.Color.blue())
 
     # Автоматичне видалення порожніх приватних кімнат
     if before.channel and before.channel.id in active_private_channels:
@@ -181,11 +226,12 @@ async def on_voice_state_update(member, before, after):
                 ch_id = before.channel.id
                 await before.channel.delete()
                 active_private_channels.pop(ch_id, None)
-                await send_log(before.guild, "Видалення кімнати", f"Порожню приватну кімнату **{ch_name}** було автоматично видалено.", discord.Color.orange())
+                await send_log(guild, "Видалення кімнати", f"Порожню приватну кімнату **{ch_name}** було автоматично видалено.", discord.Color.orange())
             except Exception as e:
                 print(f"Помилка видалення приватної кімнати: {e}")
 
 
+# --- ФОНОВІ ЗАДАЧІ ТА СТАТИСТИКА ---
 @tasks.loop(seconds=1)
 async def voice_counter_loop():
     for guild in bot.guilds:
@@ -341,15 +387,6 @@ async def on_ready():
         print(f'Синхронізовано слеш-команд: {len(synced)}')
     except Exception as e:
         print(f'Помилка синхронізації: {e}')
-
-@bot.event
-async def on_message_delete(message):
-    if message.author.bot or message.guild is None:
-        return
-    author_id = message.author.id
-    if user_messages[author_id] > 0:
-        user_messages[author_id] -= 1
-        save_data()
 
 
 # --- АКТИВНІСТЬ ТА АНТИСПАМ ---
