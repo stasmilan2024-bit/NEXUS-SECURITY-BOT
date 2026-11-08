@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import random
 import threading
 import collections
@@ -33,23 +34,50 @@ intents.voice_states = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Збереження історії та статистики активності
+# --- ЗБЕРЕЖЕННЯ ТА ЗАТАВАННЯ ДАНИХ (JSON) ---
+DATA_FILE = "data.json"
+
+user_messages = collections.defaultdict(int)
+user_voice_seconds = collections.defaultdict(int)
+user_coins = collections.defaultdict(int)
+
+def load_data():
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                for k, v in data.get("messages", {}).items():
+                    user_messages[int(k)] = v
+                for k, v in data.get("voice", {}).items():
+                    user_voice_seconds[int(k)] = v
+                for k, v in data.get("coins", {}).items():
+                    user_coins[int(k)] = v
+            print("💾 Дані успішно завантажено з data.json!")
+        except Exception as e:
+            print(f"Помилка читання data.json: {e}")
+
+def save_data():
+    try:
+        data = {
+            "messages": {str(k): v for k, v in user_messages.items()},
+            "voice": {str(k): v for k, v in user_voice_seconds.items()},
+            "coins": {str(k): v for k, v in user_coins.items()}
+        }
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        print(f"Помилка збереження у data.json: {e}")
+
+load_data()
+
+# Тимчасова історія в пам'яті
 message_history = collections.defaultdict(list)
 link_history = collections.defaultdict(list)
 ban_history = collections.defaultdict(list)
 channel_delete_history = collections.defaultdict(list)
-
-# Захист від спаму
 last_user_messages = collections.defaultdict(list)
 admin_spam_warnings = collections.defaultdict(int)
-
-# Бази даних активності в пам'яті бота
-user_messages = collections.defaultdict(int)
-user_voice_seconds = collections.defaultdict(int)
-
-# --- ЕКОНОМІКА ТА ВАЛЮТА ELITE COINS ---
-user_coins = collections.defaultdict(int)
-last_daily_claim = {} # {user_id: datetime}
+last_daily_claim = {}
 
 # --- ID КАНАЛІВ ТА НАЛАШТУВАННЯ ---
 WELCOME_CHANNEL_ID = 1566880572029018203
@@ -65,18 +93,18 @@ URL_TG_BOT = "🚧 В розробці"
 URL_TIKTOK = "https://www.tiktok.com/@your_tiktok"          
 URL_INSTAGRAM = "https://www.instagram.com/your_instagram"  
 
-# --- ID РОЛЕЙ ---
-ROLE_ACTIVE_ID = 1405600607427100854      # Активний (50 годин)
-ROLE_MASTER_ID = 1405600608576213002      # Майстер (5000 повідомлень)
-ROLE_INCREDIBLE_ID = 1405600522010103949  # Неймовірний (обидві умови)
-ROLE_MOST_ACTIVE_ID = 1405600525826920568 # Найактивніший (90 годин і 6000 повідомлень)
+# --- ID РОЛЕЙ АКТИВНОСТІ ---
+ROLE_ACTIVE_ID = 1405600607427100854      # Активний
+ROLE_MASTER_ID = 1405600608576213002      # Майстер
+ROLE_INCREDIBLE_ID = 1405600522010103949  # Неймовірний
+ROLE_MOST_ACTIVE_ID = 1405600525826920568 # Найактивніший
 
-# --- ДОСТУПНІШІ ЦІНИ ТА НОВІ ТОВАРИ У МАГАЗИНІ ---
+# --- МАГАЗИН DISCORD-РОЛЕЙ З АДЕКВАТНИМИ ЦІНАМИ ---
 SHOP_ITEMS = {
-    "1": {"name": "💸 1,000,000 $ (Ігрова валюта RP)", "price": 100, "role_id": None},
-    "2": {"name": "👑 Роль 'VIP Гравець'", "price": 200, "role_id": None},
-    "3": {"name": "🚗 Ексклюзивний авто-номер на RP", "price": 150, "role_id": None},
-    "4": {"name": "🔥 Роль 'Мажор'", "price": 400, "role_id": None}
+    "1": {"name": "🎖️ Роль 'Активний'", "price": 150, "role_id": ROLE_ACTIVE_ID},
+    "2": {"name": "💬 Роль 'Майстер'", "price": 300, "role_id": ROLE_MASTER_ID},
+    "3": {"name": "🔥 Роль 'Неймовірний'", "price": 500, "role_id": ROLE_INCREDIBLE_ID},
+    "4": {"name": "👑 Роль 'Найактивніший'", "price": 1000, "role_id": ROLE_MOST_ACTIVE_ID}
 }
 
 REQ_MSG_MASTER = 5000
@@ -99,7 +127,7 @@ def format_voice_time(total_seconds):
         return f"{seconds} сек."
 
 
-# --- ФОНОВА ЗАДАЧА: ПІДРАХУНОК СЕКУНД ТА НАРАХУВАННЯ ВАЛЮТИ ЗА ВОЙС (+5 EC ЗА 5 ХВ) ---
+# --- ФОНОВА ЗАДАЧА: ПІДРАХУНОК СЕКУНД ТА АВТОЗБЕРЕЖЕННЯ ---
 @tasks.loop(seconds=1)
 async def voice_counter_loop():
     for guild in bot.guilds:
@@ -112,6 +140,8 @@ async def voice_counter_loop():
 @tasks.loop(minutes=1)
 async def activity_loop():
     global stats_message_id
+    save_data()  # Автозбереження щохвилини у файл!
+
     poland_time = datetime.utcnow() + timedelta(hours=1)
 
     for guild in bot.guilds:
@@ -233,6 +263,7 @@ async def weekly_report_loop():
 
             user_messages.clear()
             user_voice_seconds.clear()
+            save_data()
 
 
 @activity_loop.before_loop
@@ -288,8 +319,8 @@ async def on_message_delete(message):
     author_id = message.author.id
     if user_messages[author_id] > 0:
         user_messages[author_id] -= 1
+        save_data()
 
-# --- ОБРОБКА ВСІХ ВИДІВ АКТИВНОСТІ ---
 @bot.event
 async def on_message(message):
     if message.author.bot or message.guild is None:
@@ -302,10 +333,7 @@ async def on_message(message):
 
     user_messages[author_id] += 1
     
-    # 1. Текстове повідомлення: +1 EC
     earned_ec = 1
-
-    # 2. Якщо користувач прикріпив картинку / файл / відео: +3 EC бонус
     if message.attachments:
         earned_ec += 3
 
@@ -389,24 +417,31 @@ async def on_message(message):
                     print(f"Не вдалося забанити: {e}")
 
 
-# --- 👑 КОМАНДА ВИДАЧІ ВАЛЮТИ ТІЛЬКИ ДЛЯ ВЛАСНИКА СЕРВЕРА (!givecoins) ---
+# --- 👑 КОМАНДА ВИДАЧІ ВАЛЮТИ ТІЛЬКИ ДЛЯ ВЛАСНИКА (!givecoins) ---
 @bot.command(name="givecoins", aliases=["видати"])
 async def give_coins(ctx, member: discord.Member = None, amount: int = 0):
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+
     if ctx.author.id != ctx.guild.owner_id:
         await ctx.send("❌ Ця команда доступна лише Власнику сервера!", delete_after=5)
         return
 
     if not member or amount <= 0:
-        await ctx.send("❌ Використовуйте: `!givecoins @користувач кількість` (наприклад: `!givecoins @User 500`)", delete_after=6)
+        await ctx.send("❌ Використовуйте: `!givecoins @користувач кількість`", delete_after=6)
         return
 
     user_coins[member.id] += amount
+    save_data()
+
     embed = discord.Embed(
         title="💳 Нарахування Elite Coins",
-        description=f"👑 Власник сервера нарахував **+{amount}** EC для {member.mention}!\nПоточний баланс користувача: **{user_coins[member.id]}** EC.",
+        description=f"👑 Власник сервера нарахував **+{amount}** EC для {member.mention}!\nПоточний баланс: **{user_coins[member.id]}** EC.",
         color=discord.Color.gold()
     )
-    await ctx.send(embed=embed)
+    await ctx.send(embed=embed, delete_after=60)
 
 
 # --- ТЕКСТОВА КОМАНДА !ранг ---
@@ -461,9 +496,14 @@ async def text_rank(ctx):
     await ctx.send(content=f"🕒 Ваш час: <t:{current_timestamp}:T>", embed=embed)
 
 
-# --- 🎁 ЩОДЕННИЙ БОНУС (!бонус / !daily) ---
+# --- 🎁 ЩОДЕННИЙ БОНУС (!бонус / !daily) — Видалення через 60 секунд ---
 @bot.command(name="бонус", aliases=["daily"])
 async def get_daily_bonus(ctx):
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+
     user_id = ctx.author.id
     now = datetime.now()
 
@@ -473,38 +513,44 @@ async def get_daily_bonus(ctx):
             time_left = timedelta(hours=24) - time_passed
             hours, remainder = divmod(int(time_left.total_seconds()), 3600)
             minutes, _ = divmod(remainder, 60)
-            await ctx.send(f"⏳ {ctx.author.mention}, ви вже забирали щоденний бонус! Наступний через **{hours} год. {minutes} хв.**")
+            await ctx.send(f"⏳ {ctx.author.mention}, ви вже забирали щоденний бонус! Наступний через **{hours} год. {minutes} хв.**", delete_after=60)
             return
 
     reward = random.randint(50, 150)
     user_coins[user_id] += reward
     last_daily_claim[user_id] = now
+    save_data()
     
     embed = discord.Embed(
         title="🎁 Щоденний бонус отримано!",
         description=f"{ctx.author.mention}, вам зараховано **+{reward}** Elite Coins!\nПоточний баланс: **{user_coins[user_id]}** EC.",
         color=discord.Color.gold()
     )
-    await ctx.send(embed=embed)
+    await ctx.send(embed=embed, delete_after=60)
 
 
-# --- 🎲 ДУЕЛЬ НА ВАЛЮТУ (!дуель @гравець ставка) ---
+# --- 🎲 ДУЕЛЬ НА ВАЛЮТУ (!дуель @гравець ставка) — Видалення через 60 секунд ---
 @bot.command(name="дуель")
 async def duel_coins(ctx, opponent: discord.Member = None, bet: int = 0):
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+
     if not opponent or opponent.bot or opponent == ctx.author:
-        await ctx.send("❌ Вкажіть коректного гравця для дуелі! Наприклад: `!дуель @User 50`")
+        await ctx.send("❌ Вкажіть коректного гравця для дуелі! Наприклад: `!дуель @User 50`", delete_after=60)
         return
     
     if bet <= 0:
-        await ctx.send("❌ Ставка повинна бути більше 0 EC!")
+        await ctx.send("❌ Ставка повинна бути більше 0 EC!", delete_after=60)
         return
 
     if user_coins[ctx.author.id] < bet:
-        await ctx.send(f"❌ У вас недостатньо валюти! Ваш баланс: **{user_coins[ctx.author.id]}** EC.")
+        await ctx.send(f"❌ У вас недостатньо валюти! Ваш баланс: **{user_coins[ctx.author.id]}** EC.", delete_after=60)
         return
 
     if user_coins[opponent.id] < bet:
-        await ctx.send(f"❌ У {opponent.mention} недостатньо валюти для цієї ставки!")
+        await ctx.send(f"❌ У {opponent.mention} недостатньо валюти для цієї ставки!", delete_after=60)
         return
 
     winner = random.choice([ctx.author, opponent])
@@ -512,36 +558,47 @@ async def duel_coins(ctx, opponent: discord.Member = None, bet: int = 0):
 
     user_coins[winner.id] += bet
     user_coins[loser.id] -= bet
+    save_data()
 
     embed = discord.Embed(
         title="🎲 Результат дуелі!",
         description=f"⚔️ **{ctx.author.name}** зійшовся у дуелі з **{opponent.name}** на **{bet}** EC!\n\n🏆 Переможець: {winner.mention} і забирає **+{bet}** EC!",
         color=discord.Color.purple()
     )
-    await ctx.send(embed=embed)
+    await ctx.send(embed=embed, delete_after=60)
 
 
-# --- 🛒 ДОСТУПНИЙ СЕРВЕРНИЙ МАГАЗИН (!магазин / !shop) ---
+# --- 🛒 МАГАЗИН DISCORD-РОЛЕЙ (!магазин / !shop) — Видалення через 60 секунд ---
 @bot.command(name="магазин", aliases=["shop"])
 async def view_shop(ctx):
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+
     embed = discord.Embed(
-        title="🛒 Серверний Магазин ELITE RP",
-        description="Купуйте унікальні товари та привілеї за накопичені **Elite Coins (EC)**!\nЩоб купити товар, напишіть: `!купити [номер]` (наприклад: `!купити 1`)\n",
+        title="🛒 Магазин Ролей Discord | ELITE RP",
+        description="Купуйте унікальні статусні ролі Discord за накопичені **Elite Coins (EC)**!\nЩоб купити роль, напишіть: `!купити [номер]` (наприклад: `!купити 1`)\n",
         color=discord.Color.green()
     )
     
     for item_id, info in SHOP_ITEMS.items():
         embed.add_field(name=f"Товар #{item_id}: {info['name']}", value=f"💵 Ціна: **{info['price']}** EC", inline=False)
         
-    embed.set_footer(text=f"Ваш баланс: {user_coins[ctx.author.id]} EC | Активність у чаті, войсі, картинки та !бонус!")
-    await ctx.send(embed=embed)
+    embed.set_footer(text=f"Ваш баланс: {user_coins[ctx.author.id]} EC | Заробляйте EC у чаті та войсі! (Повідомлення зникне через 1 хв)")
+    await ctx.send(embed=embed, delete_after=60)
 
 
-# --- 🛍️ КУПІВЛЯ ТОВАРУ У МАГАЗИНІ (!купити номер) ---
+# --- 🛍️ КУПІВЛЯ РОЛІ У МАГАЗИНІ (!купити номер) — Видалення через 60 секунд ---
 @bot.command(name="купити", aliases=["buy"])
 async def buy_item(ctx, item_id: str = None):
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+
     if not item_id or item_id not in SHOP_ITEMS:
-        await ctx.send("❌ Вкажіть правильний номер товару! Введіть `!магазин`, щоб переглянути товари.")
+        await ctx.send("❌ Вкажіть правильний номер товару! Введіть `!магазин`, щоб переглянути товари.", delete_after=60)
         return
 
     item = SHOP_ITEMS[item_id]
@@ -549,28 +606,32 @@ async def buy_item(ctx, item_id: str = None):
     user_id = ctx.author.id
 
     if user_coins[user_id] < price:
-        await ctx.send(f"❌ У вас недостатньо валюти для купівлі **{item['name']}**! Потрібно **{price}** EC (у вас **{user_coins[user_id]}** EC).")
+        await ctx.send(f"❌ У вас недостатньо валюти для купівлі **{item['name']}**! Потрібно **{price}** EC (у вас **{user_coins[user_id]}** EC).", delete_after=60)
         return
 
-    user_coins[user_id] -= price
+    role = ctx.guild.get_role(item["role_id"])
+    if not role:
+        await ctx.send("❌ Не вдалося знайти роль на сервері. Зверніться до адміністратора.", delete_after=60)
+        return
 
-    role_given = False
-    if item["role_id"]:
-        role = ctx.guild.get_role(item["role_id"])
-        if role:
-            try:
-                await ctx.author.add_roles(role)
-                role_given = True
-            except Exception:
-                pass
+    if role in ctx.author.roles:
+        await ctx.send(f"❌ У вас вже є роль **{role.name}**!", delete_after=60)
+        return
 
-    msg = f"🎉 {ctx.author.mention}, ви успішно придбали **{item['name']}** за **{price}** EC!"
-    if role_given:
-        msg += " Роль успішно видано!"
-    else:
-        msg += "\n📢 *Заявка створена! Адміністрація зв'яжеться з вами для видачі товару.*"
+    try:
+        user_coins[user_id] -= price
+        await ctx.author.add_roles(role)
+        save_data()
 
-    await ctx.send(msg)
+        embed = discord.Embed(
+            title="🛍️ Успішна покупка ролі!",
+            description=f"🎉 {ctx.author.mention}, ви успішно придбали **{item['name']}** за **{price}** EC!\n\n✅ **Роль успішно видано!**",
+            color=discord.Color.blue()
+        )
+        embed.set_footer(text="ELITE RP | Автоматичний магазин ролей (Повідомлення зникне через 1 хв)")
+        await ctx.send(embed=embed, delete_after=60)
+    except Exception as e:
+        await ctx.send(f"❌ Помилка при видачі ролі: {e}", delete_after=60)
 
 
 # --- ТЕКСТОВА КОМАНДА !сервер ---
@@ -623,7 +684,7 @@ async def send_social_links(target):
     if isinstance(target, discord.Interaction):
         await target.response.send_message(embed=embed)
     else:
-        await target.send(embed=embed)
+        await target.send(embed=embed, delete_after=60)
 
 @bot.tree.command(name="links", description="Показати всі офіційні посилання та соцмережі проєкту")
 async def slash_links(interaction: discord.Interaction):
@@ -685,8 +746,8 @@ async def slash_help(interaction: discord.Interaction):
     embed = discord.Embed(title="📜 Меню команд модерації та економіки", color=discord.Color.blue())
     embed.add_field(name="`!givecoins [@гравець] [кількість]`", value="👑 Видати Elite Coins (тільки для Власника)", inline=False)
     embed.add_field(name="`!бонус` або `!daily`", value="Отримати щоденні безкоштовні EC", inline=False)
-    embed.add_field(name="`!магазин` або `!shop`", value="Переглянути магазин товарів та ролей", inline=False)
-    embed.add_field(name="`!купити [номер]`", value="Купити товар у магазині", inline=False)
+    embed.add_field(name="`!магазин` або `!shop`", value="Переглянути магазин Discord-ролей", inline=False)
+    embed.add_field(name="`!купити [номер]`", value="Купити роль у магазині", inline=False)
     embed.add_field(name="`!дуель [@гравець] [ставка]`", value="Зіграти в дуель на EC з іншим гравцем", inline=False)
     embed.add_field(name="`!ранг`", value="Перевірити свій ранг, баланс EC та активність", inline=False)
     embed.add_field(name="`/links` або `!посилання`", value="Показати всі соціальні мережі проєкту", inline=False)
@@ -847,7 +908,7 @@ async def text_forum(ctx):
     except Exception:
         pass
 
-    await ctx.send(embed=embed, view=view, delete_after=5)
+    await ctx.send(embed=embed, view=view, delete_after=60)
 
 # --- ЗАПУСК БОТА ---
 if __name__ == '__main__':
