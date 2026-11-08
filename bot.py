@@ -9,7 +9,6 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import discord
 from discord.ext import commands, tasks
-from discord import app_commands
 
 # --- ВЕБ-СЕРВЕР ДЛЯ RENDER ---
 def run_server():
@@ -70,7 +69,6 @@ def save_data():
 
 load_data()
 
-# Тимчасова історія в пам'яті
 message_history = collections.defaultdict(list)
 link_history = collections.defaultdict(list)
 ban_history = collections.defaultdict(list)
@@ -83,7 +81,7 @@ last_daily_claim = {}
 WELCOME_CHANNEL_ID = 1566880572029018203
 STATS_CHANNEL_ID = 1568373943138787349  
 RANK_CHANNEL_ID = 1405600879587098644    
-LOG_CHANNEL_ID = 1569067419740278936    # Канал для логування дій бота
+LOG_CHANNEL_ID = 1569067419740278936    
 
 # ID для приватних войсів
 CREATE_VOICE_CHANNEL_ID = 1405601386674130965
@@ -106,7 +104,6 @@ ROLE_MASTER_ID = 1405600608576213002
 ROLE_INCREDIBLE_ID = 1405600522010103949  
 ROLE_MOST_ACTIVE_ID = 1405600525826920568 
 
-# --- МАГАЗИН РОЛЕЙ ---
 SHOP_ITEMS = {
     "1": {"name": "🎖️ Роль 'Активний'", "price": 150, "role_id": ROLE_ACTIVE_ID},
     "2": {"name": "💬 Роль 'Майстер'", "price": 300, "role_id": ROLE_MASTER_ID},
@@ -135,6 +132,8 @@ def format_voice_time(total_seconds):
 
 
 async def send_log(guild, title, description, color=discord.Color.blue()):
+    if not guild:
+        return
     channel = guild.get_channel(LOG_CHANNEL_ID)
     if channel:
         embed = discord.Embed(title=f"🛡️ ЛОГ ДІЙ | {title}", description=description, color=color, timestamp=datetime.utcnow())
@@ -144,7 +143,7 @@ async def send_log(guild, title, description, color=discord.Color.blue()):
             print(f"Помилка відправки логу: {e}")
 
 
-# --- ВИПРАВЛЕНЕ МОДАЛЬНЕ ВІКНО НАЛАШТУВАННЯ КІМНАТИ ---
+# --- МОДАЛЬНЕ ВІКНО НАЛАШТУВАННЯ КІМНАТИ ---
 class RoomSettingsModal(discord.ui.Modal, title="Налаштування приватної кімнати"):
     room_name = discord.ui.TextInput(
         label="Назва вашої кімнати",
@@ -165,11 +164,16 @@ class RoomSettingsModal(discord.ui.Modal, title="Налаштування при
         self.member = member
 
     async def on_submit(self, interaction: discord.Interaction):
-        # 1. Одразу робимо defer, щоб уникнути помилки тайм-ауту Discord (3 секунди)
+        # 1. Одразу робимо defer, щоб Discord не видавав помилку часу очікування
         await interaction.response.defer(ephemeral=True)
 
         guild = interaction.guild
+        if not guild:
+            await interaction.followup.send("❌ Помилка: не вдалося визначити сервер.", ephemeral=True)
+            return
+
         category = guild.get_channel(PRIVATE_ROOMS_CATEGORY_ID)
+        cat_obj = category if isinstance(category, discord.CategoryChannel) else None
         
         try:
             limit = int(self.user_limit.value)
@@ -181,26 +185,36 @@ class RoomSettingsModal(discord.ui.Modal, title="Налаштування при
         final_name = f"🔊 | {self.room_name.value}"
 
         try:
+            # 2. Створюємо голосовий канал у потрібній категорії
             new_channel = await guild.create_voice_channel(
                 name=final_name,
                 user_limit=limit,
-                category=category if isinstance(category, discord.CategoryChannel) else None
+                category=cat_obj
             )
+            
+            # 3. Даємо власнику повні права керувати кімнатою
             await new_channel.set_permissions(self.member, manage_channels=True, move_members=True)
+            
+            # 4. Переносимо гравця у створену кімнату
             await self.member.move_to(new_channel)
             active_private_channels[new_channel.id] = self.member.id
 
-            await send_log(guild, "Створення кімнати", f"Користувач {self.member.mention} створив приватний войс: **{final_name}**", discord.Color.green())
+            await send_log(guild, "Створення кімнати", f"Користувач {self.member.mention} створив приватний войс: **{final_name}** (ліміт: {limit})", discord.Color.green())
             await interaction.followup.send(f"✅ Кімнату **«{final_name}»** успішно створено!", ephemeral=True)
         except Exception as e:
+            print(f"Помилка створення каналу: {e}")
             await interaction.followup.send(f"❌ Помилка створення каналу: {e}", ephemeral=True)
 
 
 # --- СИСТЕМА ПРИВАТНИХ ВОЙСІВ ---
 @bot.event
 async def on_voice_state_update(member, before, after):
+    if member.bot:
+        return
+
+    # Коли заходить у канал створення
     if after.channel and after.channel.id == CREATE_VOICE_CHANNEL_ID:
-        view = discord.ui.View()
+        view = discord.ui.View(timeout=120)
         button = discord.ui.Button(label="⚙️ Налаштувати кімнату", style=discord.ButtonStyle.green)
 
         async def button_callback(interaction: discord.Interaction):
@@ -215,15 +229,23 @@ async def on_voice_state_update(member, before, after):
         try:
             await member.send("⚙️ Налаштуйте свою приватну кімнату ELITE RP за допомогою кнопки нижче:", view=view)
         except Exception:
+            # Якщо у гравця закриті ЛС — створюємо автоматично
             guild = member.guild
             category = guild.get_channel(PRIVATE_ROOMS_CATEGORY_ID)
-            new_channel = await guild.create_voice_channel(
-                name=f"🔊 | Кімната {member.name}",
-                category=category if isinstance(category, discord.CategoryChannel) else None
-            )
-            await member.move_to(new_channel)
-            active_private_channels[new_channel.id] = member.id
+            cat_obj = category if isinstance(category, discord.CategoryChannel) else None
+            try:
+                new_channel = await guild.create_voice_channel(
+                    name=f"🔊 | Кімната {member.name}",
+                    category=cat_obj
+                )
+                await new_channel.set_permissions(member, manage_channels=True, move_members=True)
+                await member.move_to(new_channel)
+                active_private_channels[new_channel.id] = member.id
+                await send_log(guild, "Створення кімнати (Авто)", f"Користувач {member.mention} створив стандартну кімнату (ЛС закриті).", discord.Color.green())
+            except Exception as ex:
+                print(f"Помилка автостворення: {ex}")
 
+    # Видалення порожніх приватних кімнат
     if before.channel and before.channel.id in active_private_channels:
         if len(before.channel.members) == 0:
             try:
@@ -379,7 +401,7 @@ async def on_member_join(member: discord.Member):
 
 @bot.event
 async def on_ready():
-    print(f'Бот увійшов як {bot.user} і працює!')
+    print(f'Бот увійшов як {bot.user} і працює успішно!')
     if not voice_counter_loop.is_running():
         voice_counter_loop.start()
     if not activity_loop.is_running():
@@ -388,7 +410,7 @@ async def on_ready():
         weekly_report_loop.start()
     try:
         synced = await bot.tree.sync()
-        print(f'Синхронізовано команд: {len(synced)}')
+        print(f'Синхронізовано слеш-команд: {len(synced)}')
     except Exception as e:
         print(f'Помилка синхронізації: {e}')
 
