@@ -40,6 +40,7 @@ DATA_FILE = "data.json"
 user_messages = collections.defaultdict(int)
 user_voice_seconds = collections.defaultdict(int)
 user_coins = collections.defaultdict(int)
+user_exp = collections.defaultdict(int)
 
 def load_data():
     if os.path.exists(DATA_FILE):
@@ -52,6 +53,8 @@ def load_data():
                     user_voice_seconds[int(k)] = v
                 for k, v in data.get("coins", {}).items():
                     user_coins[int(k)] = v
+                for k, v in data.get("exp", {}).items():
+                    user_exp[int(k)] = v
             print("💾 Дані успішно завантажено з data.json!")
         except Exception as e:
             print(f"Помилка читання data.json: {e}")
@@ -61,7 +64,8 @@ def save_data():
         data = {
             "messages": {str(k): v for k, v in user_messages.items()},
             "voice": {str(k): v for k, v in user_voice_seconds.items()},
-            "coins": {str(k): v for k, v in user_coins.items()}
+            "coins": {str(k): v for k, v in user_coins.items()},
+            "exp": {str(k): v for k, v in user_exp.items()}
         }
         with open(DATA_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=4)
@@ -88,7 +92,6 @@ LOG_CHANNEL_ID = 1569067419740278936
 CREATE_VOICE_CHANNEL_ID = 1405601386674130965
 PRIVATE_ROOMS_CATEGORY_ID = 1405600664704254103
 
-# Канал ID -> Власник ID
 active_private_channels = {}
 
 # --- ПОСИЛАННЯ НА СОЦМЕРЕЖІ ---
@@ -131,6 +134,27 @@ def format_voice_time(total_seconds):
         return f"{minutes} хв. {seconds} сек."
     else:
         return f"{seconds} сек."
+
+
+# --- СИСТЕМА РОЗРАХУНКУ РІВНІВ ТА ДОСВІДУ (ДО 500 РІВНІВ) ---
+def get_level_and_exp(exp_total):
+    level = 1
+    # Формула прогресії рівня до 500
+    while level < 500:
+        exp_needed = level * 150  # Кожен наступний рівень вимагає трохи більше досвіду
+        if exp_total >= exp_needed:
+            exp_total -= exp_needed
+            level += 1
+        else:
+            break
+    
+    if level >= 500:
+        level = 500
+        exp_needed = 500 * 150
+        exp_total = exp_needed
+
+    current_level_exp_max = level * 150
+    return level, exp_total, current_level_exp_max
 
 
 async def send_log(guild, title, description, color=discord.Color.blue()):
@@ -207,7 +231,6 @@ async def on_voice_state_update(member, before, after):
         except Exception as e:
             print(f"Помилка створення приватної кімнати: {e}")
 
-    # Переміщення у войсі
     if before.channel != after.channel:
         if before.channel is None and after.channel is not None:
             await send_log(guild, "Вхід у войс", f"Користувач {member.mention} зайшов у голосовий канал **{after.channel.name}**.", discord.Color.blue())
@@ -216,7 +239,6 @@ async def on_voice_state_update(member, before, after):
         elif before.channel is not None and after.channel is not None:
             await send_log(guild, "Переміщення у войсі", f"Користувач {member.mention} перейшов з **{before.channel.name}** у **{after.channel.name}**.", discord.Color.blue())
 
-    # Видалення порожніх приватних кімнат
     if before.channel and before.channel.id in active_private_channels:
         if len(before.channel.members) == 0:
             try:
@@ -321,6 +343,7 @@ async def voice_counter_loop():
         for member in guild.members:
             if member.voice and member.voice.channel and not member.bot:
                 user_voice_seconds[member.id] += 1
+                user_exp[member.id] += 1  # 1 EXP за кожну секунду у войсі
                 if user_voice_seconds[member.id] % 300 == 0:
                     user_coins[member.id] += 5
 
@@ -329,51 +352,6 @@ async def activity_loop():
     global stats_message_id
     save_data()
     poland_time = datetime.utcnow() + timedelta(hours=1)
-
-    for guild in bot.guilds:
-        for member in guild.members:
-            if member.bot:
-                continue
-            
-            m_count = user_messages[member.id]
-            v_hours = user_voice_seconds[member.id] / 3600.0
-
-            r_active = guild.get_role(ROLE_ACTIVE_ID)
-            r_master = guild.get_role(ROLE_MASTER_ID)
-            r_incredible = guild.get_role(ROLE_INCREDIBLE_ID)
-            r_most_active = guild.get_role(ROLE_MOST_ACTIVE_ID)
-
-            if m_count >= REQ_MSG_MOST and v_hours >= REQ_VOICE_MOST:
-                if r_most_active and r_most_active not in member.roles:
-                    try:
-                        roles_to_remove = [r for r in [r_active, r_master, r_incredible] if r in member.roles]
-                        if roles_to_remove:
-                            await member.remove_roles(*roles_to_remove)
-                        await member.add_roles(r_most_active)
-                    except Exception:
-                        pass
-                continue
-
-            if m_count >= REQ_MSG_MASTER and r_master and r_master not in member.roles:
-                try:
-                    await member.add_roles(r_master)
-                except Exception:
-                    pass
-
-            if v_hours >= REQ_VOICE_ACTIVE and r_active and r_active not in member.roles:
-                try:
-                    await member.add_roles(r_active)
-                except Exception:
-                    pass
-
-            has_master = r_master in member.roles if r_master else False
-            has_active = r_active in member.roles if r_active else False
-
-            if has_master and has_active and r_incredible and r_incredible not in member.roles:
-                try:
-                    await member.add_roles(r_incredible)
-                except Exception:
-                    pass
 
     stats_channel = bot.get_channel(STATS_CHANNEL_ID)
     if stats_channel:
@@ -421,13 +399,10 @@ async def weekly_report_loop():
         if stats_channel:
             embed = discord.Embed(
                 title="🏆 ПІДСУМКОВИЙ ТИЖНЕВИЙ ЗВІТ АКТИВНОСТІ",
-                description="Офіційні підсумки активності за тиждень. Статистика обнулена!",
+                description="Офіційні підсумки активності за тиждень.",
                 color=discord.Color.gold()
             )
             await stats_channel.send(embed=embed)
-            user_messages.clear()
-            user_voice_seconds.clear()
-            save_data()
 
 
 @activity_loop.before_loop
@@ -483,13 +458,16 @@ async def on_message(message):
     perms = message.author.guild_permissions
     is_owner = (message.author.id == message.guild.owner_id)
 
+    # Нарахування за активність у чаті
     user_messages[author_id] += 1
+    user_exp[author_id] += 15  # +15 EXP за кожне надіслане повідомлення
     
     earned_ec = 1
     if message.attachments:
         earned_ec += 3
 
     user_coins[author_id] += earned_ec
+    save_data() # Зберігаємо одразу, щоб дані не втрачалися
 
     is_admin_or_mod = perms.administrator or perms.manage_messages or perms.kick_members or perms.ban_members
 
@@ -505,17 +483,6 @@ async def on_message(message):
                 return
             except Exception:
                 pass
-        elif not is_owner:
-            link_history[author_id].append(now)
-            link_history[author_id] = [t for t in link_history[author_id] if now - t < timedelta(seconds=60)]
-
-            if len(link_history[author_id]) > 3:
-                try:
-                    await message.delete()
-                    await message.channel.send(f'⚠️ {message.author.mention}, ліміт посилань перевищено!', delete_after=5)
-                    return
-                except Exception:
-                    pass
 
     await bot.process_commands(message)
 
@@ -591,9 +558,24 @@ async def text_rank(ctx):
         await ctx.send("❌ Команда лише у спеціальному каналі!", delete_after=4)
         return
 
+    user_id = ctx.author.id
+    total_exp = user_exp[user_id]
+    level, current_exp, max_exp = get_level_and_exp(total_exp)
+
+    # Генерація красивої шкали прогресу (10 блоків)
+    progress_blocks = 10
+    filled_blocks = int((current_exp / max_exp) * progress_blocks) if max_exp > 0 else 0
+    if filled_blocks > progress_blocks:
+        filled_blocks = progress_blocks
+    bar = "█" * filled_blocks + "░" * (progress_blocks - filled_blocks)
+
     embed = discord.Embed(title=f"💳 Картка рангу — {ctx.author.name}", color=discord.Color.dark_theme())
     embed.set_thumbnail(url=ctx.author.display_avatar.url)
-    embed.description = "Статус: **Учасник спільноти ELITE RP**"
+    embed.add_field(name="⭐ Рівень", value=f"**{level}** / 500", inline=True)
+    embed.add_field(name="📈 Досвід (EXP)", value=f"**{current_exp}** / **{max_exp}**", inline=True)
+    embed.add_field(name="📊 Шкала прогресу", value=f"`{bar}` ({int((current_exp/max_exp)*100)}%)", inline=False)
+    embed.add_field(name="💵 Баланс балів", value=f"**{user_coins[user_id]}** EC", inline=False)
+    embed.set_footer(text="ELITE RP | Система рівнів та активності")
     
     await ctx.send(content=f"🕒 <t:{int(datetime.utcnow().timestamp())}:T>", embed=embed, delete_after=60)
 
@@ -786,7 +768,7 @@ async def slash_help(interaction: discord.Interaction):
     embed.add_field(name="`!магазин`", value="Магазин ролей", inline=False)
     embed.add_field(name="`!купити [номер]`", value="Купити роль", inline=False)
     embed.add_field(name="`!дуель`", value="Дуель на коїни", inline=False)
-    embed.add_field(name="`!ранг`", value="Перевірити профіль", inline=False)
+    embed.add_field(name="`!ранг`", value="Перевірити рівень та прогрес", inline=False)
     embed.add_field(name="`!lock` / `!unlock`", value="Закрити/відкрити приватний войс", inline=False)
     embed.add_field(name="`!rename [назва]`", value="Змінити назву приватного войсу", inline=False)
     embed.add_field(name="`!limit [число]`", value="Встановити ліміт учасників у войсі", inline=False)
