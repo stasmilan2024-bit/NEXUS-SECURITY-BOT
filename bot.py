@@ -88,6 +88,7 @@ LOG_CHANNEL_ID = 1569067419740278936
 CREATE_VOICE_CHANNEL_ID = 1405601386674130965
 PRIVATE_ROOMS_CATEGORY_ID = 1405600664704254103
 
+# Канал ID -> Власник ID
 active_private_channels = {}
 
 # --- ПОСИЛАННЯ НА СОЦМЕРЕЖІ ---
@@ -146,13 +147,11 @@ async def send_log(guild, title, description, color=discord.Color.blue()):
 
 # --- СИСТЕМА ЛОГУВАННЯ ---
 
-# 1. Лог видалення повідомлень (з пропуском команд)
 @bot.event
 async def on_message_delete(message):
     if message.author.bot or message.guild is None:
         return
     
-    # Ігноруємо команди, щоб вони не потрапляли в логи
     if message.content.startswith("!") or message.content.startswith("/"):
         return
 
@@ -166,7 +165,6 @@ async def on_message_delete(message):
     await send_log(message.guild, "Видалення повідомлення", desc, discord.Color.orange())
 
 
-# 2. Лог змін ролей та нікнеймів
 @bot.event
 async def on_member_update(before: discord.Member, after: discord.Member):
     guild = after.guild
@@ -187,7 +185,6 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         await send_log(guild, "Зміна нікнейма", f"Користувач {after.mention} змінив нікнейм:\nСтарий: `{old_nick}`\nНовий: `{new_nick}`", discord.Color.purple())
 
 
-# 3. Лог войсів та створення приватних кімнат
 @bot.event
 async def on_voice_state_update(member, before, after):
     if member.bot:
@@ -203,7 +200,7 @@ async def on_voice_state_update(member, before, after):
         room_name = f"🔊 | Кімната {member.name}"
         try:
             new_channel = await guild.create_voice_channel(name=room_name, category=cat_obj)
-            await new_channel.set_permissions(member, manage_channels=True, move_members=True)
+            await new_channel.set_permissions(member, manage_channels=True, move_members=True, connect=True)
             await member.move_to(new_channel)
             active_private_channels[new_channel.id] = member.id
             await send_log(guild, "Створення кімнати", f"Користувач {member.mention} створив приватний войс: **{room_name}**", discord.Color.green())
@@ -230,6 +227,91 @@ async def on_voice_state_update(member, before, after):
                 await send_log(before.guild, "Видалення кімнати", f"Порожню приватну кімнату **{ch_name}** було автоматично видалено.", discord.Color.orange())
             except Exception as e:
                 print(f"Помилка видалення приватної кімнати: {e}")
+
+
+# --- 🔊 КОМАНДИ КЕРУВАННЯ ПРИВАТНИМИ КІМНАТАМИ ---
+
+def is_room_owner():
+    async def predicate(ctx):
+        if not ctx.author.voice or not ctx.author.voice.channel:
+            await ctx.send("❌ Ви повинні перебувати у своїй приватній кімнаті!", delete_after=5)
+            return False
+        channel_id = ctx.author.voice.channel.id
+        if channel_id not in active_private_channels or active_private_channels[channel_id] != ctx.author.id:
+            await ctx.send("❌ Ви не є власником цієї приватної кімнати!", delete_after=5)
+            return False
+        return True
+    return commands.check(predicate)
+
+@bot.command(name="lock", aliases=["закрити"])
+@is_room_owner()
+async def lock_room(ctx):
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+    channel = ctx.author.voice.channel
+    await channel.set_permissions(ctx.guild.default_role, connect=False)
+    await ctx.send(f"🔒 {ctx.author.mention} закрив кімнату **{channel.name}** для входу!", delete_after=10)
+
+@bot.command(name="unlock", aliases=["відкрити"])
+@is_room_owner()
+async def unlock_room(ctx):
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+    channel = ctx.author.voice.channel
+    await channel.set_permissions(ctx.guild.default_role, connect=None)
+    await ctx.send(f"🔓 {ctx.author.mention} відкрив кімнату **{channel.name}**!", delete_after=10)
+
+@bot.command(name="rename", aliases=["назва"])
+@is_room_owner()
+async def rename_room(ctx, *, new_name: str = None):
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+    if not new_name:
+        await ctx.send("❌ Вкажіть нову назву: `!rename Моя Кімната`", delete_after=5)
+        return
+    channel = ctx.author.voice.channel
+    formatted_name = f"🔊 | {new_name}"
+    await channel.edit(name=formatted_name)
+    await ctx.send(f"✏️ Назву кімнати змінено на **{formatted_name}**!", delete_after=10)
+
+@bot.command(name="limit", aliases=["ліміт"])
+@is_room_owner()
+async def limit_room(ctx, limit: int = None):
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+    if limit is None or limit < 0 or limit > 99:
+        await ctx.send("❌ Вкажіть ліміт від 0 до 99: `!limit 5`", delete_after=5)
+        return
+    channel = ctx.author.voice.channel
+    await channel.edit(user_limit=limit)
+    txt = f"без обмежень" if limit == 0 else f"{limit} осіб"
+    await ctx.send(f"👥 Встановлено ліміт кімнати: **{txt}**!", delete_after=10)
+
+@bot.command(name="vkick", aliases=["вкік"])
+@is_room_owner()
+async def vkick_room(ctx, member: discord.Member = None):
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+    if not member:
+        await ctx.send("❌ Вкажіть користувача: `!vkick @user`", delete_after=5)
+        return
+    channel = ctx.author.voice.channel
+    if member.voice and member.voice.channel.id == channel.id:
+        await member.move_to(None)
+        await channel.set_permissions(member, connect=False)
+        await ctx.send(f"🚫 {member.mention} вигнано з вашої кімнати!", delete_after=10)
+    else:
+        await ctx.send("❌ Цього гравця немає у вашій кімнаті!", delete_after=5)
 
 
 # --- ФОНОВІ ЗАДАЧІ ---
@@ -578,7 +660,6 @@ async def duel_coins(ctx, opponent: discord.Member = None, bet: int = 0):
 
 @bot.command(name="магазин", aliases=["shop"])
 async def view_shop(ctx):
-    # Спочатку видаляємо команду
     try:
         await ctx.message.delete()
     except Exception:
@@ -712,6 +793,10 @@ async def slash_help(interaction: discord.Interaction):
     embed.add_field(name="`!купити [номер]`", value="Купити роль", inline=False)
     embed.add_field(name="`!дуель`", value="Дуель на коїни", inline=False)
     embed.add_field(name="`!ранг`", value="Перевірити профіль", inline=False)
+    embed.add_field(name="`!lock` / `!unlock`", value="Закрити/відкрити приватний войс", inline=False)
+    embed.add_field(name="`!rename [назва]`", value="Змінити назву приватного войсу", inline=False)
+    embed.add_field(name="`!limit [число]`", value="Встановити ліміт учасників у войсі", inline=False)
+    embed.add_field(name="`!vkick @user`", value="Вигнати гравця зі свого войсу", inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="clear", description="Очистити чат")
