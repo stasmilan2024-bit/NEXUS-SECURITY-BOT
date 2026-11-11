@@ -591,16 +591,10 @@ async def text_rank(ctx):
         await ctx.send("❌ Команда лише у спеціальному каналі!", delete_after=4)
         return
 
-    user_id = ctx.author.id
-    m_count = user_messages[user_id]
-    v_secs = user_voice_seconds[user_id]
-    coins = user_coins[user_id]
-
     embed = discord.Embed(title=f"💳 Картка рангу — {ctx.author.name}", color=discord.Color.dark_theme())
     embed.set_thumbnail(url=ctx.author.display_avatar.url)
-    embed.add_field(name="💵 Баланс", value=f"**{coins}** EC", inline=False)
-    embed.add_field(name="💬 Повідомлення", value=f"**{m_count}**", inline=False)
-    embed.add_field(name="🎙️ Войс", value=f"**{format_voice_time(v_secs)}**", inline=False)
+    embed.description = "Статус: **Учасник спільноти ELITE RP**"
+    
     await ctx.send(content=f"🕒 <t:{int(datetime.utcnow().timestamp())}:T>", embed=embed, delete_after=60)
 
 
