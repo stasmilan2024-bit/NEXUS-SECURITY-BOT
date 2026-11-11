@@ -82,7 +82,7 @@ last_daily_claim = {}
 WELCOME_CHANNEL_ID = 1566880572029018203
 STATS_CHANNEL_ID = 1568373943138787349  
 RANK_CHANNEL_ID = 1405600879587098644    
-LOG_CHANNEL_ID = 1569067419740278936    # Канал для логування дій
+LOG_CHANNEL_ID = 1569067419740278936    
 
 # ID для приватних войсів
 CREATE_VOICE_CHANNEL_ID = 1405601386674130965
@@ -144,15 +144,18 @@ async def send_log(guild, title, description, color=discord.Color.blue()):
             print(f"Помилка відправки логу: {e}")
 
 
-# --- РОЗШИРЕНІ ПОДІЇ ЛОГУВАННЯ ---
+# --- СИСТЕМА ЛОГУВАННЯ ---
 
-# 1. Лог видалення повідомлень
+# 1. Лог видалення повідомлень (з пропуском команд)
 @bot.event
 async def on_message_delete(message):
     if message.author.bot or message.guild is None:
         return
     
-    # Коригуємо лічильник повідомлень в статистиці
+    # Ігноруємо команди, щоб вони не потрапляли в логи
+    if message.content.startswith("!") or message.content.startswith("/"):
+        return
+
     author_id = message.author.id
     if user_messages[author_id] > 0:
         user_messages[author_id] -= 1
@@ -163,12 +166,11 @@ async def on_message_delete(message):
     await send_log(message.guild, "Видалення повідомлення", desc, discord.Color.orange())
 
 
-# 2. Лог видачі/зняття ролей та зміни нікнеймів
+# 2. Лог змін ролей та нікнеймів
 @bot.event
 async def on_member_update(before: discord.Member, after: discord.Member):
     guild = after.guild
 
-    # Перевірка на зміну ролей
     if before.roles != after.roles:
         added_roles = [r for r in after.roles if r not in before.roles]
         removed_roles = [r for r in before.roles if r not in after.roles]
@@ -179,14 +181,13 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         for role in removed_roles:
             await send_log(guild, "Зняття ролі", f"З користувача {after.mention} знято роль **{role.name}**.", discord.Color.red())
 
-    # Перевірка на зміну нікнейма
     if before.nick != after.nick:
         old_nick = before.nick or before.name
         new_nick = after.nick or after.name
         await send_log(guild, "Зміна нікнейма", f"Користувач {after.mention} змінив нікнейм:\nСтарий: `{old_nick}`\nНовий: `{new_nick}`", discord.Color.purple())
 
 
-# 3. Лог переходів у голосові канали (вхід, вихід, переміщення)
+# 3. Лог войсів та створення приватних кімнат
 @bot.event
 async def on_voice_state_update(member, before, after):
     if member.bot:
@@ -194,7 +195,7 @@ async def on_voice_state_update(member, before, after):
 
     guild = member.guild
 
-    # Логіка створення приватних кімнат
+    # Створення приватних кімнат
     if after.channel and after.channel.id == CREATE_VOICE_CHANNEL_ID:
         category = guild.get_channel(PRIVATE_ROOMS_CATEGORY_ID)
         cat_obj = category if isinstance(category, discord.CategoryChannel) else None
@@ -209,7 +210,7 @@ async def on_voice_state_update(member, before, after):
         except Exception as e:
             print(f"Помилка створення приватної кімнати: {e}")
 
-    # Логування звичайних переміщень у войсі
+    # Переміщення у войсі
     if before.channel != after.channel:
         if before.channel is None and after.channel is not None:
             await send_log(guild, "Вхід у войс", f"Користувач {member.mention} зайшов у голосовий канал **{after.channel.name}**.", discord.Color.blue())
@@ -218,7 +219,7 @@ async def on_voice_state_update(member, before, after):
         elif before.channel is not None and after.channel is not None:
             await send_log(guild, "Переміщення у войсі", f"Користувач {member.mention} перейшов з **{before.channel.name}** у **{after.channel.name}**.", discord.Color.blue())
 
-    # Автоматичне видалення порожніх приватних кімнат
+    # Видалення порожніх приватних кімнат
     if before.channel and before.channel.id in active_private_channels:
         if len(before.channel.members) == 0:
             try:
@@ -226,12 +227,12 @@ async def on_voice_state_update(member, before, after):
                 ch_id = before.channel.id
                 await before.channel.delete()
                 active_private_channels.pop(ch_id, None)
-                await send_log(guild, "Видалення кімнати", f"Порожню приватну кімнату **{ch_name}** було автоматично видалено.", discord.Color.orange())
+                await send_log(before.guild, "Видалення кімнати", f"Порожню приватну кімнату **{ch_name}** було автоматично видалено.", discord.Color.orange())
             except Exception as e:
                 print(f"Помилка видалення приватної кімнати: {e}")
 
 
-# --- ФОНОВІ ЗАДАЧІ ТА СТАТИСТИКА ---
+# --- ФОНОВІ ЗАДАЧІ ---
 @tasks.loop(seconds=1)
 async def voice_counter_loop():
     for guild in bot.guilds:
@@ -499,11 +500,12 @@ async def give_coins(ctx, member: discord.Member = None, amount: int = 0):
 
 @bot.command(name="ранг")
 async def text_rank(ctx):
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+
     if ctx.channel.id != RANK_CHANNEL_ID:
-        try:
-            await ctx.message.delete()
-        except Exception:
-            pass
         await ctx.send("❌ Команда лише у спеціальному каналі!", delete_after=4)
         return
 
@@ -517,7 +519,7 @@ async def text_rank(ctx):
     embed.add_field(name="💵 Баланс", value=f"**{coins}** EC", inline=False)
     embed.add_field(name="💬 Повідомлення", value=f"**{m_count}**", inline=False)
     embed.add_field(name="🎙️ Войс", value=f"**{format_voice_time(v_secs)}**", inline=False)
-    await ctx.send(content=f"🕒 <t:{int(datetime.utcnow().timestamp())}:T>", embed=embed)
+    await ctx.send(content=f"🕒 <t:{int(datetime.utcnow().timestamp())}:T>", embed=embed, delete_after=60)
 
 
 @bot.command(name="бонус", aliases=["daily"])
@@ -576,14 +578,21 @@ async def duel_coins(ctx, opponent: discord.Member = None, bet: int = 0):
 
 @bot.command(name="магазин", aliases=["shop"])
 async def view_shop(ctx):
+    # Спочатку видаляємо команду
     try:
         await ctx.message.delete()
     except Exception:
         pass
 
-    embed = discord.Embed(title="🛒 Магазин Ролей Discord", description="Напишіть `!купити [номер]`, щоб отримати роль:", color=discord.Color.green())
+    embed = discord.Embed(
+        title="🛒 Магазин Ролей Discord | ELITE RP",
+        description="Напишіть `!купити [номер]`, щоб отримати роль:",
+        color=discord.Color.green()
+    )
     for item_id, info in SHOP_ITEMS.items():
         embed.add_field(name=f"Товар #{item_id}: {info['name']}", value=f"💵 Ціна: **{info['price']}** EC", inline=False)
+    
+    embed.set_footer(text=f"Ваш баланс: {user_coins[ctx.author.id]} EC")
     await ctx.send(embed=embed, delete_after=60)
 
 
@@ -621,11 +630,15 @@ async def buy_item(ctx, item_id: str = None):
 
 @bot.command(name="сервер")
 async def text_server(ctx):
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
     guild = ctx.guild
     embed = discord.Embed(title=f"📌 Сервер: {guild.name}", color=discord.Color.gold())
     embed.add_field(name="👑 Власник", value=guild.owner.mention if guild.owner else "Невідомо", inline=True)
     embed.add_field(name="👥 Учасників", value=f"**{guild.member_count}**", inline=True)
-    await ctx.send(embed=embed)
+    await ctx.send(embed=embed, delete_after=60)
 
 
 async def send_social_links(target):
