@@ -2,6 +2,7 @@ import os
 import re
 import json
 import random
+import asyncio
 import threading
 import collections
 from datetime import datetime, timedelta
@@ -10,6 +11,8 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
+import yt_dlp
+import imageio_ffmpeg
 
 # --- ВЕБ-СЕРВЕР ДЛЯ RENDER ---
 def run_server():
@@ -34,7 +37,30 @@ intents.voice_states = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# --- ЗБЕРЕЖЕННЯ ТА ЗАТАВАННЯ ДАНИХ (JSON) ---
+# --- НАЛАШТУВАННЯ МУЗИКИ (YT-DLP + FFMPEG) ---
+FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+
+YTDL_OPTIONS = {
+    'format': 'bestaudio/best',
+    'noplaylist': True,
+    'nocheckcertificate': True,
+    'ignoreerrors': False,
+    'logtostderr': False,
+    'quiet': True,
+    'no_warnings': True,
+    'default_search': 'ytsearch',
+    'source_address': '0.0.0.0',
+}
+
+FFMPEG_OPTIONS = {
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+    'options': '-vn'
+}
+
+ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
+music_queues = collections.defaultdict(collections.deque)
+
+# --- ЗБЕРЕЖЕННЯ ТА ЗАВАНТАЖЕННЯ ДАНИХ (JSON) ---
 DATA_FILE = "data.json"
 
 user_messages = collections.defaultdict(int)
@@ -116,11 +142,6 @@ SHOP_ITEMS = {
     "4": {"name": "👑 Роль 'Найактивніший'", "price": 1000, "role_id": ROLE_MOST_ACTIVE_ID}
 }
 
-REQ_MSG_MASTER = 5000
-REQ_VOICE_ACTIVE = 50  
-REQ_MSG_MOST = 6000
-REQ_VOICE_MOST = 90    
-
 stats_message_id = None
 
 
@@ -136,12 +157,10 @@ def format_voice_time(total_seconds):
         return f"{seconds} сек."
 
 
-# --- СИСТЕМА РОЗРАХУНКУ РІВНІВ ТА ДОСВІДУ (ДО 500 РІВНІВ) ---
 def get_level_and_exp(exp_total):
     level = 1
-    # Формула прогресії рівня до 500
     while level < 500:
-        exp_needed = level * 150  # Кожен наступний рівень вимагає трохи більше досвіду
+        exp_needed = level * 150
         if exp_total >= exp_needed:
             exp_total -= exp_needed
             level += 1
@@ -167,6 +186,144 @@ async def send_log(guild, title, description, color=discord.Color.blue()):
             await channel.send(embed=embed)
         except Exception as e:
             print(f"Помилка відправки логу: {e}")
+
+
+# --- 🎵 МУЗИЧНИЙ МОДУЛЬ ---
+
+async def search_audio(query):
+    loop = asyncio.get_event_loop()
+    data = await loop.run_in_executor(None, lambda: ytdl.extract_info(query, download=False))
+    if 'entries' in data:
+        if not data['entries']:
+            return None
+        data = data['entries'][0]
+    return {
+        'url': data['url'],
+        'title': data.get('title', 'Невідомий трек'),
+        'webpage_url': data.get('webpage_url', query)
+    }
+
+def play_next_in_queue(ctx):
+    guild_id = ctx.guild.id
+    if music_queues[guild_id]:
+        next_track = music_queues[guild_id].popleft()
+        voice_client = ctx.guild.voice_client
+        if voice_client and voice_client.is_connected():
+            source = discord.FFmpegPCMAudio(next_track['url'], executable=FFMPEG_PATH, **FFMPEG_OPTIONS)
+            voice_client.play(source, after=lambda e: play_next_in_queue(ctx))
+            asyncio.run_coroutine_threadsafe(
+                ctx.send(f"🎶 Зараз грає: **[{next_track['title']}]({next_track['webpage_url']})**", delete_after=60),
+                bot.loop
+            )
+
+@bot.command(name="play", aliases=["p", "грати", "музика"])
+async def play_music(ctx, *, query: str = None):
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+
+    if not query:
+        await ctx.send("❌ Вкажіть посилання або назву пісні: `!play [посилання/назва]`", delete_after=6)
+        return
+
+    if not ctx.author.voice or not ctx.author.voice.channel:
+        await ctx.send("❌ Зайдіть у голосовий канал, щоб увімкнути музику!", delete_after=6)
+        return
+
+    voice_channel = ctx.author.voice.channel
+    voice_client = ctx.guild.voice_client
+
+    if not voice_client:
+        voice_client = await voice_channel.connect()
+    elif voice_client.channel != voice_channel:
+        await voice_client.move_to(voice_channel)
+
+    status_msg = await ctx.send(f"🔎 Шукаю: `{query}`...")
+
+    try:
+        track = await search_audio(query)
+        if not track:
+            await status_msg.edit(content="❌ Нічого не знайдено за вашим запитом!", delete_after=6)
+            return
+
+        if voice_client.is_playing() or voice_client.is_paused():
+            music_queues[ctx.guild.id].append(track)
+            await status_msg.edit(content=f"➕ Додано в чергу: **{track['title']}**", delete_after=30)
+        else:
+            source = discord.FFmpegPCMAudio(track['url'], executable=FFMPEG_PATH, **FFMPEG_OPTIONS)
+            voice_client.play(source, after=lambda e: play_next_in_queue(ctx))
+            await status_msg.edit(content=f"🎶 Зараз грає: **[{track['title']}]({track['webpage_url']})**", delete_after=60)
+    except Exception as e:
+        await status_msg.edit(content=f"❌ Помилка відтворення: майданчик заблокував доступ або посилання недійсне.", delete_after=8)
+        print(f"Помилка музики: {e}")
+
+@bot.command(name="skip", aliases=["s", "пропустити"])
+async def skip_music(ctx):
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+
+    voice_client = ctx.guild.voice_client
+    if voice_client and voice_client.is_playing():
+        voice_client.stop()
+        await ctx.send("⏭️ Трек пропущено!", delete_after=10)
+    else:
+        await ctx.send("❌ Зараз нічого не грає.", delete_after=5)
+
+@bot.command(name="pause", aliases=["пауза"])
+async def pause_music(ctx):
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+
+    voice_client = ctx.guild.voice_client
+    if voice_client and voice_client.is_playing():
+        voice_client.pause()
+        await ctx.send("⏸️ Музику поставлено на паузу.", delete_after=10)
+
+@bot.command(name="resume", aliases=["продовжити"])
+async def resume_music(ctx):
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+
+    voice_client = ctx.guild.voice_client
+    if voice_client and voice_client.is_paused():
+        voice_client.resume()
+        await ctx.send("▶️ Відтворення продовжено!", delete_after=10)
+
+@bot.command(name="stop", aliases=["leave", "стоп"])
+async def stop_music(ctx):
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+
+    music_queues[ctx.guild.id].clear()
+    voice_client = ctx.guild.voice_client
+    if voice_client:
+        await voice_client.disconnect()
+        await ctx.send("⏹️ Музику зупинено, бот вийшов із войсу.", delete_after=10)
+
+@bot.command(name="queue", aliases=["q", "черга"])
+async def show_queue(ctx):
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+
+    queue = music_queues[ctx.guild.id]
+    if not queue:
+        await ctx.send("📭 Черга треків порожня.", delete_after=10)
+        return
+
+    desc = "\n".join([f"**{i}.** {t['title']}" for i, t in enumerate(list(queue)[:10], 1)])
+    embed = discord.Embed(title="🎵 Черга відтворення", description=desc, color=discord.Color.blue())
+    await ctx.send(embed=embed, delete_after=30)
 
 
 # --- СИСТЕМА ЛОГУВАННЯ ---
@@ -216,7 +373,6 @@ async def on_voice_state_update(member, before, after):
 
     guild = member.guild
 
-    # Створення приватних кімнат
     if after.channel and after.channel.id == CREATE_VOICE_CHANNEL_ID:
         category = guild.get_channel(PRIVATE_ROOMS_CATEGORY_ID)
         cat_obj = category if isinstance(category, discord.CategoryChannel) else None
@@ -343,7 +499,7 @@ async def voice_counter_loop():
         for member in guild.members:
             if member.voice and member.voice.channel and not member.bot:
                 user_voice_seconds[member.id] += 1
-                user_exp[member.id] += 1  # 1 EXP за кожну секунду у войсі
+                user_exp[member.id] += 1
                 if user_voice_seconds[member.id] % 300 == 0:
                     user_coins[member.id] += 5
 
@@ -458,16 +614,15 @@ async def on_message(message):
     perms = message.author.guild_permissions
     is_owner = (message.author.id == message.guild.owner_id)
 
-    # Нарахування за активність у чаті
     user_messages[author_id] += 1
-    user_exp[author_id] += 15  # +15 EXP за кожне надіслане повідомлення
+    user_exp[author_id] += 15
     
     earned_ec = 1
     if message.attachments:
         earned_ec += 3
 
     user_coins[author_id] += earned_ec
-    save_data() # Зберігаємо одразу, щоб дані не втрачалися
+    save_data()
 
     is_admin_or_mod = perms.administrator or perms.manage_messages or perms.kick_members or perms.ban_members
 
@@ -562,7 +717,6 @@ async def text_rank(ctx):
     total_exp = user_exp[user_id]
     level, current_exp, max_exp = get_level_and_exp(total_exp)
 
-    # Генерація красивої шкали прогресу (10 блоків)
     progress_blocks = 10
     filled_blocks = int((current_exp / max_exp) * progress_blocks) if max_exp > 0 else 0
     if filled_blocks > progress_blocks:
@@ -763,16 +917,15 @@ async def on_guild_channel_delete(channel):
 @bot.tree.command(name="help", description="Доступні команди")
 async def slash_help(interaction: discord.Interaction):
     embed = discord.Embed(title="📜 Меню команд", color=discord.Color.blue())
+    embed.add_field(name="`!play [назва/посилання]`", value="Увімкнути музику у войсі", inline=False)
+    embed.add_field(name="`!skip` / `!pause` / `!resume` / `!stop`", value="Керування плеєром", inline=False)
+    embed.add_field(name="`!queue`", value="Переглянути чергу треків", inline=False)
     embed.add_field(name="`!givecoins`", value="Видати коїни (тільки Власнику)", inline=False)
     embed.add_field(name="`!бонус` / `!daily`", value="Щоденний бонус", inline=False)
-    embed.add_field(name="`!магазин`", value="Магазин ролей", inline=False)
-    embed.add_field(name="`!купити [номер]`", value="Купити роль", inline=False)
+    embed.add_field(name="`!магазин` / `!купити`", value="Магазин ролей", inline=False)
     embed.add_field(name="`!дуель`", value="Дуель на коїни", inline=False)
     embed.add_field(name="`!ранг`", value="Перевірити рівень та прогрес", inline=False)
-    embed.add_field(name="`!lock` / `!unlock`", value="Закрити/відкрити приватний войс", inline=False)
-    embed.add_field(name="`!rename [назва]`", value="Змінити назву приватного войсу", inline=False)
-    embed.add_field(name="`!limit [число]`", value="Встановити ліміт учасників у войсі", inline=False)
-    embed.add_field(name="`!vkick @user`", value="Вигнати гравця зі свого войсу", inline=False)
+    embed.add_field(name="`!lock` / `!unlock` / `!rename` / `!limit` / `!vkick`", value="Керування приватним войсом", inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="clear", description="Очистити чат")
