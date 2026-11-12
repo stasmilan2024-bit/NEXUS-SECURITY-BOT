@@ -90,9 +90,10 @@ last_daily_claim = {}
 # --- ID КАНАЛІВ ТА НАЛАШТУВАННЯ ---
 WELCOME_CHANNEL_ID = 1566880572029018203
 STATS_CHANNEL_ID = 1568373943138787349  
-RANK_CHANNEL_ID = 1405600879587098644    # Канал привітань з рівнем
-LOG_CHANNEL_ID = 1569067419740278936    
-TICKET_CHANNEL_ID = 1570511794190028960 # Канал для панелі тікетів та звернень
+RANK_CHANNEL_ID = 1405600879587098644      # Канал привітань з рівнем
+LOG_CHANNEL_ID = 1569067419740278936      
+ADMIN_QUESTIONS_CHANNEL_ID = 1570510766186958858  # Канал, куди бот надсилає питання адмінам для відповіді
+TICKET_PANEL_CHANNEL_ID = 1570511794190028960    # Канал, де закріплена панель для створення звернень
 
 # ID для приватних войсів
 CREATE_VOICE_CHANNEL_ID = 1405601386674130965
@@ -191,7 +192,7 @@ async def send_log(guild, title, description, color=discord.Color.blue()):
             print(f"Помилка відправки логу: {e}")
 
 
-# --- 🎫 СИСТЕМА ТІКЕТІВ ТА ПОВІДОМЛЕНЬ ДЛЯ АДМІНІСТРАЦІЇ ---
+# --- 🎫 СИСТЕМА ЗВЕРНЕНЬ ТА ПІДТРИМКИ ---
 
 class AdminReplyModal(discord.ui.Modal, title="Відповідь адміністрації"):
     reply_text = discord.ui.TextInput(
@@ -218,7 +219,7 @@ class AdminReplyModal(discord.ui.Modal, title="Відповідь адмініс
         embed.set_footer(text="Статус: Відповідь надано")
 
         await interaction.message.edit(embed=embed, view=None)
-        await interaction.response.send_message("✅ Відповідь опубліковано в цьому каналі!", ephemeral=True)
+        await interaction.response.send_message("✅ Відповідь опубліковано!", ephemeral=True)
 
         target_member = interaction.guild.get_member(self.target_user_id)
         if target_member:
@@ -269,9 +270,9 @@ class AskQuestionModal(discord.ui.Modal, title="Нове питання до а�
     )
 
     async def on_submit(self, interaction: discord.Interaction):
-        ticket_channel = interaction.guild.get_channel(TICKET_CHANNEL_ID)
-        if not ticket_channel:
-            await interaction.response.send_message("❌ Канал звернень не знайдено.", ephemeral=True)
+        admin_channel = interaction.guild.get_channel(ADMIN_QUESTIONS_CHANNEL_ID)
+        if not admin_channel:
+            await interaction.response.send_message("❌ Канал для адміністраторів не знайдено.", ephemeral=True)
             return
 
         embed = discord.Embed(
@@ -284,10 +285,10 @@ class AskQuestionModal(discord.ui.Modal, title="Нове питання до а�
         embed.add_field(name="👤 Автор", value=interaction.user.mention, inline=True)
         embed.set_footer(text=f"Очікує відповіді | ID: {interaction.user.id}")
 
-        # Питання надсилається в цей же канал для адмінів
-        await ticket_channel.send(embed=embed, view=AdminReplyView())
-        await interaction.response.send_message("✅ Ваше питання успішно надіслано адміністрації в цей канал!", ephemeral=True)
-        await send_log(interaction.guild, "Нове звернення", f"Користувач {interaction.user.mention} залишив питання у каналі підтримки.", discord.Color.orange())
+        # Надсилаємо питання в канал для адміністраторів (1570510766186958858)
+        await admin_channel.send(embed=embed, view=AdminReplyView())
+        await interaction.response.send_message("✅ Ваше питання успішно надіслано адміністрації!", ephemeral=True)
+        await send_log(interaction.guild, "Нове звернення", f"Користувач {interaction.user.mention} залишив питання для адміністрації.", discord.Color.orange())
 
 
 class TicketPanelView(discord.ui.View):
@@ -300,25 +301,25 @@ class TicketPanelView(discord.ui.View):
 
 
 async def setup_ticket_panel():
-    ticket_channel = bot.get_channel(TICKET_CHANNEL_ID)
-    if not ticket_channel:
+    panel_channel = bot.get_channel(TICKET_PANEL_CHANNEL_ID)
+    if not panel_channel:
         return
 
     embed = discord.Embed(
         title="🎫 ПІДТРИМКА ТА ЗВЕРНЕННЯ | ELITE RP",
-        description="Маєте запитання до адміністрації або потрібна допомога?\nНатисніть кнопку **«Задати питання»** нижче, заповніть форму, і бот опублікує ваше звернення в цьому ж каналі для розгляду адміністрацією.",
+        description="Маєте запитання до адміністрації або потрібна допомога?\nНатисніть кнопку **«Задати питання»** нижче, заповніть форму, і ваше звернення надійде адміністраторам.",
         color=discord.Color.gold()
     )
-    embed.set_footer(text="ELITE RP | Система звернень")
+    embed.set_footer(text="ELITE RP | Панель звернень")
 
     try:
-        pins = await ticket_channel.pins()
+        pins = await panel_channel.pins()
         for pin in pins:
             if pin.author == bot.user and pin.embeds and "ПІДТРИМКА ТА ЗВЕРНЕННЯ" in (pin.embeds[0].title or ""):
                 await pin.edit(embed=embed, view=TicketPanelView())
                 return
         
-        msg = await ticket_channel.send(embed=embed, view=TicketPanelView())
+        msg = await panel_channel.send(embed=embed, view=TicketPanelView())
         await msg.pin()
     except Exception as e:
         print(f"Помилка закріплення панелі звернень: {e}")
