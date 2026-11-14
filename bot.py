@@ -5,7 +5,7 @@ import random
 import asyncio
 import threading
 import collections
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import discord
@@ -32,6 +32,7 @@ intents.members = True
 intents.guilds = True
 intents.moderation = True
 intents.voice_states = True
+intents.webhooks = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -80,22 +81,24 @@ def save_data():
 load_data()
 
 message_history = collections.defaultdict(list)
-link_history = collections.defaultdict(list)
 ban_history = collections.defaultdict(list)
 channel_delete_history = collections.defaultdict(list)
+role_delete_history = collections.defaultdict(list)
 last_user_messages = collections.defaultdict(list)
 admin_spam_warnings = collections.defaultdict(int)
 last_daily_claim = {}
 
+# --- НАЛАШТУВАННЯ БЕЗПЕКИ (ANTI-TWINK) ---
+MIN_ACCOUNT_AGE_DAYS = 7          # Мінімальний вік акаунта в днях (фільтр твінків)
+
 # --- ID КАНАЛІВ ТА НАЛАШТУВАННЯ ---
 WELCOME_CHANNEL_ID = 1566880572029018203
 STATS_CHANNEL_ID = 1568373943138787349  
-RANK_CHANNEL_ID = 1405600879587098644      # Канал привітань з рівнем
+RANK_CHANNEL_ID = 1405600879587098644      
 LOG_CHANNEL_ID = 1569067419740278936      
-ADMIN_QUESTIONS_CHANNEL_ID = 1570510766186958858  # Канал, куди бот надсилає питання адмінам для відповіді
-TICKET_PANEL_CHANNEL_ID = 1570511794190028960    # Канал, де закріплена панель для створення звернень
+ADMIN_QUESTIONS_CHANNEL_ID = 1570510766186958858  
+TICKET_PANEL_CHANNEL_ID = 1570511794190028960    
 
-# ID для приватних войсів
 CREATE_VOICE_CHANNEL_ID = 1405601386674130965
 PRIVATE_ROOMS_CATEGORY_ID = 1405600664704254103
 
@@ -161,9 +164,8 @@ async def check_and_update_level(member, guild):
     user_id = member.id
     total_exp = user_exp[user_id]
     new_level, _, _ = get_level_and_exp(total_exp)
-    old_level = user_levels[user_id]
-
-    if new_level > old_level:
+    
+    if user_levels[user_id] < new_level:
         user_levels[user_id] = new_level
         save_data()
 
@@ -180,16 +182,38 @@ async def check_and_update_level(member, guild):
         await send_log(guild, "Підвищення рівня", f"Користувач {member.mention} підвищив рівень до **{new_level}**.", discord.Color.gold())
 
 
-async def send_log(guild, title, description, color=discord.Color.blue()):
+async def send_log(guild, title, description, color=discord.Color.blue(), ping_owner=False):
     if not guild:
         return
     channel = guild.get_channel(LOG_CHANNEL_ID)
     if channel:
-        embed = discord.Embed(title=f"🛡️ ЛОГ ДІЙ | {title}", description=description, color=color, timestamp=datetime.utcnow())
+        embed = discord.Embed(title=f"🛡️ ЛОГ ДІЙ | {title}", description=description, color=color, timestamp=datetime.now(timezone.utc))
+        content = guild.owner.mention if (ping_owner and guild.owner) else None
         try:
-            await channel.send(embed=embed)
+            await channel.send(content=content, embed=embed)
         except Exception as e:
             print(f"Помилка відправки логу: {e}")
+
+
+async def punish_rogue_admin(guild, executor, reason):
+    if not executor or executor.bot or executor.id == guild.owner_id:
+        return
+    try:
+        member = guild.get_member(executor.id)
+        if member:
+            roles_to_remove = [r for r in member.roles if r != guild.default_role and r.is_assignable()]
+            if roles_to_remove:
+                await member.remove_roles(*roles_to_remove, reason=reason)
+        await guild.ban(executor, reason=reason)
+        await send_log(
+            guild,
+            "🚨 CRITICAL SECURITY | Блокування адміністратора",
+            f"**Порушник:** `{executor}` (`{executor.id}`)\n**Причина:** {reason}\n**Дія:** Усі ролі знято, акаунт заблоковано.",
+            discord.Color.dark_red(),
+            ping_owner=True
+        )
+    except Exception as e:
+        print(f"Помилка нейтралізації порушника: {e}")
 
 
 # --- 🎫 СИСТЕМА ЗВЕРНЕНЬ ТА ПІДТРИМКИ ---
@@ -279,13 +303,12 @@ class AskQuestionModal(discord.ui.Modal, title="Нове питання до а�
             title=f"🎫 Звернення від {interaction.user.display_name}",
             description=f"**Питання:**\n{self.question.value}",
             color=discord.Color.orange(),
-            timestamp=datetime.utcnow()
+            timestamp=datetime.now(timezone.utc)
         )
         embed.set_thumbnail(url=interaction.user.display_avatar.url)
         embed.add_field(name="👤 Автор", value=interaction.user.mention, inline=True)
         embed.set_footer(text=f"Очікує відповіді | ID: {interaction.user.id}")
 
-        # Надсилаємо питання в канал для адміністраторів (1570510766186958858)
         await admin_channel.send(embed=embed, view=AdminReplyView())
         await interaction.response.send_message("✅ Ваше питання успішно надіслано адміністрації!", ephemeral=True)
         await send_log(interaction.guild, "Нове звернення", f"Користувач {interaction.user.mention} залишив питання для адміністрації.", discord.Color.orange())
@@ -325,7 +348,171 @@ async def setup_ticket_panel():
         print(f"Помилка закріплення панелі звернень: {e}")
 
 
-# --- СИСТЕМА ЛОГУВАННЯ ---
+# --- 🛡️ ЖОРСТКИЙ ANTI-BOT ТА ANTI-TWINK ЩИТ (ВХІД НА СЕРВЕР) ---
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    guild = member.guild
+    now = datetime.now(timezone.utc)
+
+    # 1. ЖОРСТКИЙ ANTI-BOT: Якщо додано стороннього бота (не Власником)
+    if member.bot:
+        is_owner_action = False
+        try:
+            async for entry in guild.audit_logs(limit=3, action=discord.AuditLogAction.bot_add):
+                if entry.target and entry.target.id == member.id:
+                    if entry.user.id != guild.owner_id:
+                        # Миттєвий бан бота і того, хто його запросив
+                        try:
+                            await member.ban(reason="Anti-Bot: Сторонніх ботів заборонено!")
+                        except Exception:
+                            pass
+                        
+                        try:
+                            rogue_admin = guild.get_member(entry.user.id)
+                            if rogue_admin:
+                                roles_to_remove = [r for r in rogue_admin.roles if r != guild.default_role and r.is_assignable()]
+                                if roles_to_remove:
+                                    await rogue_admin.remove_roles(*roles_to_remove, reason="Додав стороннього бота")
+                                await guild.ban(rogue_admin, reason="Додав стороннього бота на сервер")
+                        except Exception:
+                            pass
+
+                        await send_log(
+                            guild,
+                            "🚨 ANTI-BOT ЗАХИСТ",
+                            f"**Чужий бот:** {member.mention} (`{member.id}`)\n**Кого задіяли:** <@{entry.user.id}>\n**Дія:** Обох миттєво заблоковано!",
+                            discord.Color.dark_red(),
+                            ping_owner=True
+                        )
+                        return
+                    else:
+                        is_owner_action = True
+                        break
+        except Exception as e:
+            print(f"Помилка перевірки аудит-логів бота: {e}")
+
+        if not is_owner_action:
+            try:
+                await member.ban(reason="Anti-Bot: Несанкціонований бот")
+                return
+            except Exception:
+                pass
+
+    # 2. ФІЛЬТР ВІКУ АКАУНТА (Анти-Твінк): Менше ніж 7 днів — кік
+    account_age = now - member.created_at
+    if account_age < timedelta(days=MIN_ACCOUNT_AGE_DAYS):
+        days_old = account_age.days
+        try:
+            await member.send(
+                f"🛡️ **Система безпеки ELITE RP:**\nВаш акаунт створено занадто недавно ({days_old} дн.). "
+                f"Для захисту від твінків мінімальний вік акаунта становить **{MIN_ACCOUNT_AGE_DAYS} днів**."
+            )
+        except Exception:
+            pass
+        try:
+            await member.kick(reason=f"Anti-Twink: Вік акаунта {days_old} дн. (мін. {MIN_ACCOUNT_AGE_DAYS} дн.)")
+            await send_log(
+                guild,
+                "🕵️ Anti-Twink Блокування",
+                f"Користувача `{member}` (`{member.id}`) не допущено на сервер.\n**Вік акаунта:** {days_old} дн. (поріг: {MIN_ACCOUNT_AGE_DAYS} дн.)",
+                discord.Color.orange()
+            )
+        except Exception as e:
+            print(f"Помилка Anti-Twink: {e}")
+        return
+
+    # Якщо перевірки пройдено успішно
+    channel = guild.get_channel(WELCOME_CHANNEL_ID)
+    if channel:
+        embed = discord.Embed(
+            title=f"Вітаємо на ELITE RP, {member.name}! 👋",
+            description=f"Привіт, {member.mention}!\n\n**Раді бачити тебе на нашому сервері!** 🎉",
+            color=discord.Color.blue()
+        )
+        embed.set_thumbnail(url=member.display_avatar.url)
+        await channel.send(embed=embed)
+    await send_log(guild, "Новий учасник", f"Користувач {member.mention} (`{member.name}`) пройшов перевірку безпеки та приєднався.", discord.Color.green())
+
+
+# --- 🧬 КОНТРОЛЬ ЦІЛІСНОСТІ ПРАВ, РОЛЕЙ ТА ВЕБХУКІВ ---
+
+@bot.event
+async def on_guild_role_update(before: discord.Role, after: discord.Role):
+    guild = after.guild
+    dangerous_perms = [
+        after.permissions.administrator,
+        after.permissions.manage_guild,
+        after.permissions.manage_roles,
+        after.permissions.ban_members,
+        after.permissions.manage_webhooks,
+        after.permissions.manage_channels
+    ]
+    before_dangerous = [
+        before.permissions.administrator,
+        before.permissions.manage_guild,
+        before.permissions.manage_roles,
+        before.permissions.ban_members,
+        before.permissions.manage_webhooks,
+        before.permissions.manage_channels
+    ]
+
+    if any(dangerous_perms) and not any(before_dangerous):
+        async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.role_update):
+            if entry.target.id == after.id and entry.user.id != guild.owner_id and not entry.user.bot:
+                try:
+                    await after.edit(permissions=before.permissions, reason="Anti-Privilege Escalation: Відкат небезпечних прав")
+                except Exception:
+                    pass
+                await punish_rogue_admin(guild, entry.user, f"Спроба видати небезпечні права ролі `{after.name}`")
+
+
+@bot.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+    guild = after.guild
+
+    if before.roles != after.roles:
+        added_roles = [r for r in after.roles if r not in before.roles]
+        removed_roles = [r for r in before.roles if r not in after.roles]
+
+        for role in added_roles:
+            if role.permissions.administrator or role.permissions.manage_guild:
+                async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.member_role_update):
+                    if entry.target.id == after.id and entry.user.id != guild.owner_id and not entry.user.bot:
+                        try:
+                            await after.remove_roles(role, reason="Anti-Admin Grant: Несанкціонована видача адмін-ролі")
+                        except Exception:
+                            pass
+                        await punish_rogue_admin(guild, entry.user, f"Спроба видати адмін-роль `{role.name}` гравцю `{after}`")
+                        return
+
+            await send_log(guild, "Видача ролі", f"Користувачу {after.mention} видано роль **{role.name}**.", discord.Color.green())
+        
+        for role in removed_roles:
+            await send_log(guild, "Зняття ролі", f"З користувача {after.mention} знято роль **{role.name}**.", discord.Color.red())
+
+    if before.nick != after.nick:
+        old_nick = before.nick or before.name
+        new_nick = after.nick or after.name
+        await send_log(guild, "Зміна нікнейма", f"Користувач {after.mention} змінив нікнейм:\nСтарий: `{old_nick}`\nНовий: `{new_nick}`", discord.Color.purple())
+
+
+@bot.event
+async def on_webhooks_update(channel):
+    guild = channel.guild
+    async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.webhook_create):
+        if entry.user.id != guild.owner_id and not entry.user.bot:
+            try:
+                webhooks = await channel.webhooks()
+                for wh in webhooks:
+                    if wh.id == entry.target.id:
+                        await wh.delete(reason="Anti-Webhook Trap: Заборонено створювати вебхуки")
+            except Exception:
+                pass
+            await punish_rogue_admin(guild, entry.user, f"Спроба створити вебхук у каналі `#{channel.name}`")
+
+
+# --- СИСТЕМА ЛОГУВАННЯ ТА ВОЙСІВ ---
 
 @bot.event
 async def on_message_delete(message):
@@ -343,26 +530,6 @@ async def on_message_delete(message):
     content = message.content if message.content else "*[Медіафайл / Вкладення]*"
     desc = f"**Автор:** {message.author.mention}\n**Канал:** {message.channel.mention}\n**Повідомлення:** {content}"
     await send_log(message.guild, "Видалення повідомлення", desc, discord.Color.orange())
-
-
-@bot.event
-async def on_member_update(before: discord.Member, after: discord.Member):
-    guild = after.guild
-
-    if before.roles != after.roles:
-        added_roles = [r for r in after.roles if r not in before.roles]
-        removed_roles = [r for r in before.roles if r not in after.roles]
-
-        for role in added_roles:
-            await send_log(guild, "Видача ролі", f"Користувачу {after.mention} видано роль **{role.name}**.", discord.Color.green())
-        
-        for role in removed_roles:
-            await send_log(guild, "Зняття ролі", f"З користувача {after.mention} знято роль **{role.name}**.", discord.Color.red())
-
-    if before.nick != after.nick:
-        old_nick = before.nick or before.name
-        new_nick = after.nick or after.name
-        await send_log(guild, "Зміна нікнейма", f"Користувач {after.mention} змінив нікнейм:\nСтарий: `{old_nick}`\nНовий: `{new_nick}`", discord.Color.purple())
 
 
 @bot.event
@@ -507,7 +674,7 @@ async def voice_counter_loop():
 async def activity_loop():
     global stats_message_id
     save_data()
-    poland_time = datetime.utcnow() + timedelta(hours=1)
+    poland_time = datetime.now(timezone.utc) + timedelta(hours=1)
 
     stats_channel = bot.get_channel(STATS_CHANNEL_ID)
     if stats_channel:
@@ -549,7 +716,7 @@ async def activity_loop():
 
 @tasks.loop(minutes=1)
 async def weekly_report_loop():
-    poland_time = datetime.utcnow() + timedelta(hours=1)
+    poland_time = datetime.now(timezone.utc) + timedelta(hours=1)
     if poland_time.weekday() == 6 and poland_time.hour == 23 and poland_time.minute == 0:
         stats_channel = bot.get_channel(STATS_CHANNEL_ID)
         if stats_channel:
@@ -575,19 +742,6 @@ async def before_weekly_loop():
 
 
 @bot.event
-async def on_member_join(member: discord.Member):
-    channel = member.guild.get_channel(WELCOME_CHANNEL_ID)
-    if channel:
-        embed = discord.Embed(
-            title=f"Вітаємо на ELITE RP, {member.name}! 👋",
-            description=f"Привіт, {member.mention}!\n\n**Раді бачити тебе на нашому сервері!** 🎉",
-            color=discord.Color.blue()
-        )
-        embed.set_thumbnail(url=member.display_avatar.url)
-        await channel.send(embed=embed)
-    await send_log(member.guild, "Новий учасник", f"Користувач {member.mention} (`{member.name}`) приєднався до сервера.", discord.Color.green())
-
-@bot.event
 async def on_ready():
     print(f'Бот увійшов як {bot.user} і працює успішно!')
     bot.add_view(TicketPanelView())
@@ -607,7 +761,7 @@ async def on_ready():
         print(f'Помилка синхронізації: {e}')
 
 
-# --- АКТИВНІСТЬ ТА АНТИСПАМ ---
+# --- 🧠 ПОВЕДІНКОВИЙ СКАНЕР СПАМУ ТА ФІШИНГУ ---
 @bot.event
 async def on_message(message):
     if message.author.bot or message.guild is None:
@@ -617,6 +771,39 @@ async def on_message(message):
     now = datetime.now()
     perms = message.author.guild_permissions
     is_owner = (message.author.id == message.guild.owner_id)
+    is_admin_or_mod = perms.administrator or perms.manage_messages or perms.kick_members or perms.ban_members
+
+    if not is_admin_or_mod:
+        content_lower = message.content.lower()
+        scam_keywords = ["free nitro", "steam gift", "airdrop", "discord.gift", "discrod", "dlscord", "@everyone", "@here"]
+        has_scam = any(word in content_lower for word in scam_keywords)
+        has_mass_mentions = len(message.mentions) >= 4
+
+        if has_scam or has_mass_mentions:
+            try:
+                await message.delete()
+                await message.author.timeout(timedelta(hours=24), reason="Anti-Scam / Масові згадки")
+                await message.channel.purge(limit=20, check=lambda m: m.author.id == author_id)
+                await send_log(
+                    message.guild,
+                    "🚨 Anti-Scam / Raid-Ping",
+                    f"Користувач {message.author.mention} спробував надіслати фішинг або масовий тег.\n**Дія:** Повідомлення видалено, видано ізоляцію на **24 години**.",
+                    discord.Color.dark_red(),
+                    ping_owner=True
+                )
+            except Exception as e:
+                print(f"Помилка Anti-Scam: {e}")
+            return
+
+        url_pattern = r'(https?://[^\s]+|www\.[^\s]+|discord\.gg/[^\s]+)'
+        if re.search(url_pattern, message.content):
+            try:
+                await message.delete()
+                await message.channel.send(f'{message.author.mention}, посилання заборонені!', delete_after=5)
+                await send_log(message.guild, "Заборонене посилання", f"Користувач {message.author.mention} надіслав посилання в канал {message.channel.mention} (видалено).", discord.Color.orange())
+            except Exception:
+                pass
+            return
 
     user_messages[author_id] += 1
     user_exp[author_id] += 15
@@ -628,21 +815,6 @@ async def on_message(message):
 
     user_coins[author_id] += earned_ec
     save_data()
-
-    is_admin_or_mod = perms.administrator or perms.manage_messages or perms.kick_members or perms.ban_members
-
-    url_pattern = r'(https?://[^\s]+|www\.[^\s]+|discord\.gg/[^\s]+)'
-    has_link = bool(re.search(url_pattern, message.content))
-
-    if has_link:
-        if not is_admin_or_mod:
-            try:
-                await message.delete()
-                await message.channel.send(f'{message.author.mention}, посилання заборонені!', delete_after=5)
-                await send_log(message.guild, "Заборонене посилання", f"Користувач {message.author.mention} надіслав посилання в канал {message.channel.mention} (видалено).", discord.Color.orange())
-                return
-            except Exception:
-                pass
 
     await bot.process_commands(message)
 
@@ -684,7 +856,7 @@ async def on_message(message):
                     print(f"Помилка бану: {e}")
 
 
-# --- КОМАНДИ ---
+# --- ОСНОВНІ КОМАНДИ ---
 @bot.command(name="givecoins", aliases=["видати"])
 async def give_coins(ctx, member: discord.Member = None, amount: int = 0):
     try:
@@ -736,7 +908,7 @@ async def text_rank(ctx):
     embed.add_field(name="💵 Баланс балів", value=f"**{user_coins[user_id]}** EC", inline=False)
     embed.set_footer(text="ELITE RP | Система рівнів та активності")
     
-    await ctx.send(content=f"🕒 <t:{int(datetime.utcnow().timestamp())}:T>", embed=embed, delete_after=60)
+    await ctx.send(content=f"🕒 <t:{int(datetime.now(timezone.utc).timestamp())}:T>", embed=embed, delete_after=60)
 
 
 @bot.command(name="бонус", aliases=["daily"])
@@ -881,6 +1053,8 @@ async def text_links(ctx):
     await send_social_links(ctx)
 
 
+# --- ANTI-NUKE (МАСОВІ БАНИ, ВИДАЛЕННЯ КАНАЛІВ ТА РОЛЕЙ) ---
+
 @bot.event
 async def on_member_ban(guild, user):
     async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.ban):
@@ -892,12 +1066,8 @@ async def on_member_ban(guild, user):
         ban_history[executor.id].append(now)
         ban_history[executor.id] = [t for t in ban_history[executor.id] if now - t < timedelta(seconds=10)]
 
-        if len(ban_history[executor.id]) > 3:
-            try:
-                await guild.ban(executor, reason="Anti-Nuke: Масовий бан")
-                await send_log(guild, "🚨 Anti-Nuke BAN", f"Користувач `{executor}` спробував масово забанити учасників і був заблокований!", discord.Color.dark_red())
-            except Exception as e:
-                print(f"Помилка захисту: {e}")
+        if len(ban_history[executor.id]) >= 2:
+            await punish_rogue_admin(guild, executor, "Anti-Nuke: Масовий бан учасників")
 
 @bot.event
 async def on_guild_channel_delete(channel):
@@ -911,12 +1081,23 @@ async def on_guild_channel_delete(channel):
         channel_delete_history[executor.id].append(now)
         channel_delete_history[executor.id] = [t for t in channel_delete_history[executor.id] if now - t < timedelta(seconds=10)]
 
-        if len(channel_delete_history[executor.id]) > 2:
-            try:
-                await guild.ban(executor, reason="Anti-Nuke: Масове видалення каналів")
-                await send_log(guild, "🚨 Anti-Nuke CHANNEL DELETE", f"Користувач `{executor}` видаляв канали і був заблокований!", discord.Color.dark_red())
-            except Exception as e:
-                print(f"Помилка захисту каналів: {e}")
+        if len(channel_delete_history[executor.id]) >= 2:
+            await punish_rogue_admin(guild, executor, "Anti-Nuke: Масове видалення каналів")
+
+@bot.event
+async def on_guild_role_delete(role):
+    guild = role.guild
+    async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.role_delete):
+        executor = entry.user
+        if executor.bot or executor.id == guild.owner_id:
+            return
+
+        now = datetime.now()
+        role_delete_history[executor.id].append(now)
+        role_delete_history[executor.id] = [t for t in role_delete_history[executor.id] if now - t < timedelta(seconds=10)]
+
+        if len(role_delete_history[executor.id]) >= 2:
+            await punish_rogue_admin(guild, executor, "Anti-Nuke: Масове видалення ролей")
 
 
 @bot.tree.command(name="help", description="Доступні команди")
