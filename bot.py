@@ -105,10 +105,10 @@ PRIVATE_ROOMS_CATEGORY_ID = 1405600664704254103
 active_private_channels = {}
 
 # --- ПОСИЛАННЯ НА СОЦМЕРЕЖІ ---
-URL_SITE = "https://eliterp.pp.ua"                         
+URL_SITE = "https://elite-rp.qniks.me"                     
 URL_FORUM = "http://eliterpforum.sytes.net/index.php"       
-URL_TG_CHANNEL = "https://t.me/your_telegram_channel"       
-URL_TG_CHAT = "https://t.me/your_telegram_chat"             
+URL_TG_CHANNEL = "🚧 В розробці"                            
+URL_TG_CHAT = "🚧 В розробці"                               
 URL_TG_BOT = "🚧 В розробці"                                
 URL_TIKTOK = "https://www.tiktok.com/@your_tiktok"          
 URL_INSTAGRAM = "https://www.instagram.com/your_instagram"  
