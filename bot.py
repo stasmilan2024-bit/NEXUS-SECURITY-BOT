@@ -1469,4 +1469,3 @@ if __name__ == '__main__':
         bot.run(TOKEN)
     else:
         print("Помилка: Не знайдено DISCORD_TOKEN!")
-Выполняю анализ
