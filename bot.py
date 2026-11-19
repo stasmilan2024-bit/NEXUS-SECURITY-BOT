@@ -36,7 +36,7 @@ intents.webhooks = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# --- ЗБЕРЕЖЕННЯ ТА ЗАВАНТАЖЕННЯ ДАНИХ (JSON) ---
+# --- ЗБЕРЕЖЕННЯ ТА ВІДНОВЛЕННЯ ДАНИХ (ХМАРНИЙ БЕКАП У DISCORD + JSON) ---
 DATA_FILE = "data.json"
 
 user_messages = collections.defaultdict(int)
@@ -45,36 +45,43 @@ user_coins = collections.defaultdict(int)
 user_exp = collections.defaultdict(int)
 user_levels = collections.defaultdict(lambda: 1)
 
+db_backup_message_id = None
+data_restored = False
+
+def serialize_data_dict():
+    return {
+        "messages": {str(k): v for k, v in user_messages.items() if v > 0},
+        "voice": {str(k): v for k, v in user_voice_seconds.items() if v > 0},
+        "coins": {str(k): v for k, v in user_coins.items() if v > 0},
+        "exp": {str(k): v for k, v in user_exp.items() if v > 0},
+        "levels": {str(k): v for k, v in user_levels.items() if v > 1}
+    }
+
+def apply_data_dict(data: dict):
+    for k, v in data.get("messages", {}).items():
+        user_messages[int(k)] = max(user_messages[int(k)], int(v))
+    for k, v in data.get("voice", {}).items():
+        user_voice_seconds[int(k)] = max(user_voice_seconds[int(k)], int(v))
+    for k, v in data.get("coins", {}).items():
+        user_coins[int(k)] = max(user_coins[int(k)], int(v))
+    for k, v in data.get("exp", {}).items():
+        user_exp[int(k)] = max(user_exp[int(k)], int(v))
+    for k, v in data.get("levels", {}).items():
+        user_levels[int(k)] = max(user_levels[int(k)], int(v))
+
 def load_data():
     if os.path.exists(DATA_FILE):
         try:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                for k, v in data.get("messages", {}).items():
-                    user_messages[int(k)] = v
-                for k, v in data.get("voice", {}).items():
-                    user_voice_seconds[int(k)] = v
-                for k, v in data.get("coins", {}).items():
-                    user_coins[int(k)] = v
-                for k, v in data.get("exp", {}).items():
-                    user_exp[int(k)] = v
-                for k, v in data.get("levels", {}).items():
-                    user_levels[int(k)] = v
-            print("💾 Дані успішно завантажено з data.json!")
+                apply_data_dict(json.load(f))
+            print("💾 Дані завантажено з локального data.json!")
         except Exception as e:
             print(f"Помилка читання data.json: {e}")
 
 def save_data():
     try:
-        data = {
-            "messages": {str(k): v for k, v in user_messages.items()},
-            "voice": {str(k): v for k, v in user_voice_seconds.items()},
-            "coins": {str(k): v for k, v in user_coins.items()},
-            "exp": {str(k): v for k, v in user_exp.items()},
-            "levels": {str(k): v for k, v in user_levels.items()}
-        }
         with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=4)
+            json.dump(serialize_data_dict(), f, ensure_ascii=False, indent=4)
     except Exception as e:
         print(f"Помилка збереження у data.json: {e}")
 
@@ -88,8 +95,24 @@ last_user_messages = collections.defaultdict(list)
 admin_spam_warnings = collections.defaultdict(int)
 last_daily_claim = {}
 
-# --- НАЛАШТУВАННЯ БЕЗПЕКИ (ANTI-TWINK) ---
-MIN_ACCOUNT_AGE_DAYS = 7          # Мінімальний вік акаунта в днях (фільтр твінків)
+# --- НАЛАШТУВАННЯ БЕЗПЕКИ ---
+MIN_ACCOUNT_AGE_DAYS = 7
+
+# Ролі, яким дозволено видавати будь-які ролі та редагувати права без блокування
+TRUSTED_ROLE_NAMES = {
+    "власник",
+    "заступник власника",
+}
+
+def is_trusted_role_manager(guild: discord.Guild, user: discord.User | discord.Member | None) -> bool:
+    if not guild or not user or user.bot:
+        return False
+    if user.id == guild.owner_id:
+        return True
+    member = guild.get_member(user.id)
+    if not member:
+        return False
+    return any(role.name.strip().lower() in TRUSTED_ROLE_NAMES for role in member.roles)
 
 # --- ID КАНАЛІВ ТА НАЛАШТУВАННЯ ---
 WELCOME_CHANNEL_ID = 1566880572029018203
@@ -127,6 +150,103 @@ SHOP_ITEMS = {
 }
 
 stats_message_id = None
+
+
+def parse_voice_time(text: str) -> int:
+    hours = re.search(r'(\d+)\s*год\.', text)
+    minutes = re.search(r'(\d+)\s*хв\.', text)
+    seconds = re.search(r'(\d+)\s*сек\.', text)
+    total = 0
+    if hours:
+        total += int(hours.group(1)) * 3600
+    if minutes:
+        total += int(minutes.group(1)) * 60
+    if seconds:
+        total += int(seconds.group(1))
+    return total
+
+
+async def restore_data_from_discord():
+    """Відновлює статистику після перезапуску Render із бекап-повідомлення та топу статистики."""
+    global db_backup_message_id, stats_message_id, data_restored
+
+    # 1. Спроба завантажити повну JSON-базу із закріпленого бекапу в лог-каналі
+    log_channel = bot.get_channel(LOG_CHANNEL_ID)
+    if log_channel:
+        try:
+            pins = await log_channel.pins()
+            for pin in pins:
+                if pin.author == bot.user and pin.content.startswith("📦 `ELITE_DB_BACKUP`"):
+                    db_backup_message_id = pin.id
+                    match = re.search(r'```json\n(.*?)\n```', pin.content, re.DOTALL)
+                    if match:
+                        apply_data_dict(json.loads(match.group(1)))
+                        print("☁️ Повну базу даних відновлено з хмарного бекапу Discord!")
+                    break
+        except Exception as e:
+            print(f"Помилка читання бекапу з лог-каналу: {e}")
+
+    # 2. Додатковий парсинг актуального повідомлення статистики (щоб не втратити свіжі цифри)
+    stats_channel = bot.get_channel(STATS_CHANNEL_ID)
+    if stats_channel:
+        try:
+            async for message in stats_channel.history(limit=10):
+                if message.author == bot.user and message.embeds:
+                    emb = message.embeds[0]
+                    if "Статистика активності гравців" in (emb.title or ""):
+                        stats_message_id = message.id
+                        for field in emb.fields:
+                            if "повідомленнями" in field.name:
+                                for line in field.value.splitlines():
+                                    m = re.search(r'<@!?(\d+)>.*?(\d+)\*\*\s*пов\.', line)
+                                    if m:
+                                        uid, cnt = int(m.group(1)), int(m.group(2))
+                                        user_messages[uid] = max(user_messages[uid], cnt)
+                            elif "войсі" in field.name:
+                                for line in field.value.splitlines():
+                                    m = re.search(r'<@!?(\d+)>.*?\*\*(.*?)\*\*', line)
+                                    if m:
+                                        uid, v_str = int(m.group(1)), m.group(2)
+                                        secs = parse_voice_time(v_str)
+                                        if secs > 0:
+                                            user_voice_seconds[uid] = max(user_voice_seconds[uid], secs)
+                        print("📊 Дані синхронізовано з повідомлення статистики!")
+                        break
+        except Exception as e:
+            print(f"Помилка парсингу статистики: {e}")
+
+    save_data()
+    data_restored = True
+
+
+async def sync_cloud_backup():
+    """Зберігає повну копію статистики у закріпленому повідомленні в лог-каналі."""
+    global db_backup_message_id
+    if not data_restored:
+        return
+    log_channel = bot.get_channel(LOG_CHANNEL_ID)
+    if not log_channel:
+        return
+
+    payload = json.dumps(serialize_data_dict(), ensure_ascii=False, separators=(',', ':'))
+    if len(payload) > 1900:
+        return
+
+    content = f"📦 `ELITE_DB_BACKUP` (Автозбереження статистики — не видаляти)\n```json\n{payload}\n```"
+    try:
+        if db_backup_message_id:
+            try:
+                msg = await log_channel.fetch_message(db_backup_message_id)
+                await msg.edit(content=content)
+                return
+            except Exception:
+                db_backup_message_id = None
+
+        msg = await log_channel.send(content=content)
+        await msg.pin()
+        db_backup_message_id = msg.id
+    except Exception as e:
+        print(f"Помилка хмарного бекапу: {e}")
 
 
 def format_voice_time(total_seconds):
@@ -196,7 +316,7 @@ async def send_log(guild, title, description, color=discord.Color.blue(), ping_o
 
 
 async def punish_rogue_admin(guild, executor, reason):
-    if not executor or executor.bot or executor.id == guild.owner_id:
+    if not executor or executor.bot or is_trusted_role_manager(guild, executor):
         return
     try:
         member = guild.get_member(executor.id)
@@ -355,14 +475,13 @@ async def on_member_join(member: discord.Member):
     guild = member.guild
     now = datetime.now(timezone.utc)
 
-    # 1. ЖОРСТКИЙ ANTI-BOT: Якщо додано стороннього бота (не Власником)
+    # 1. ЖОРСТКИЙ ANTI-BOT: Якщо додано стороннього бота (не Власником / Заступником)
     if member.bot:
-        is_owner_action = False
+        is_trusted_action = False
         try:
             async for entry in guild.audit_logs(limit=3, action=discord.AuditLogAction.bot_add):
                 if entry.target and entry.target.id == member.id:
-                    if entry.user.id != guild.owner_id:
-                        # Миттєвий бан бота і того, хто його запросив
+                    if not is_trusted_role_manager(guild, entry.user):
                         try:
                             await member.ban(reason="Anti-Bot: Сторонніх ботів заборонено!")
                         except Exception:
@@ -387,12 +506,12 @@ async def on_member_join(member: discord.Member):
                         )
                         return
                     else:
-                        is_owner_action = True
+                        is_trusted_action = True
                         break
         except Exception as e:
             print(f"Помилка перевірки аудит-логів бота: {e}")
 
-        if not is_owner_action:
+        if not is_trusted_action:
             try:
                 await member.ban(reason="Anti-Bot: Несанкціонований бот")
                 return
@@ -459,7 +578,9 @@ async def on_guild_role_update(before: discord.Role, after: discord.Role):
 
     if any(dangerous_perms) and not any(before_dangerous):
         async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.role_update):
-            if entry.target.id == after.id and entry.user.id != guild.owner_id and not entry.user.bot:
+            if entry.target.id == after.id and not entry.user.bot:
+                if is_trusted_role_manager(guild, entry.user):
+                    break
                 try:
                     await after.edit(permissions=before.permissions, reason="Anti-Privilege Escalation: Відкат небезпечних прав")
                 except Exception:
@@ -478,7 +599,9 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         for role in added_roles:
             if role.permissions.administrator or role.permissions.manage_guild:
                 async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.member_role_update):
-                    if entry.target.id == after.id and entry.user.id != guild.owner_id and not entry.user.bot:
+                    if entry.target.id == after.id and not entry.user.bot:
+                        if is_trusted_role_manager(guild, entry.user):
+                            break
                         try:
                             await after.remove_roles(role, reason="Anti-Admin Grant: Несанкціонована видача адмін-ролі")
                         except Exception:
@@ -501,7 +624,7 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 async def on_webhooks_update(channel):
     guild = channel.guild
     async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.webhook_create):
-        if entry.user.id != guild.owner_id and not entry.user.bot:
+        if not is_trusted_role_manager(guild, entry.user) and not entry.user.bot:
             try:
                 webhooks = await channel.webhooks()
                 for wh in webhooks:
@@ -661,6 +784,8 @@ async def vkick_room(ctx, member: discord.Member = None):
 # --- ФОНОВІ ЗАДАЧІ ---
 @tasks.loop(seconds=1)
 async def voice_counter_loop():
+    if not data_restored:
+        return
     for guild in bot.guilds:
         for member in guild.members:
             if member.voice and member.voice.channel and not member.bot:
@@ -673,6 +798,8 @@ async def voice_counter_loop():
 @tasks.loop(minutes=1)
 async def activity_loop():
     global stats_message_id
+    if not data_restored:
+        return
     save_data()
     poland_time = datetime.now(timezone.utc) + timedelta(hours=1)
 
@@ -714,6 +841,11 @@ async def activity_loop():
             print(f"Помилка оновлення статистики: {e}")
 
 
+@tasks.loop(minutes=5)
+async def cloud_backup_loop():
+    await sync_cloud_backup()
+
+
 @tasks.loop(minutes=1)
 async def weekly_report_loop():
     poland_time = datetime.now(timezone.utc) + timedelta(hours=1)
@@ -736,6 +868,10 @@ async def before_activity_loop():
 async def before_voice_loop():
     await bot.wait_until_ready()
 
+@cloud_backup_loop.before_loop
+async def before_backup_loop():
+    await bot.wait_until_ready()
+
 @weekly_report_loop.before_loop
 async def before_weekly_loop():
     await bot.wait_until_ready()
@@ -744,6 +880,7 @@ async def before_weekly_loop():
 @bot.event
 async def on_ready():
     print(f'Бот увійшов як {bot.user} і працює успішно!')
+    await restore_data_from_discord()
     bot.add_view(TicketPanelView())
     bot.add_view(AdminReplyView())
     await setup_ticket_panel()
@@ -752,6 +889,8 @@ async def on_ready():
         voice_counter_loop.start()
     if not activity_loop.is_running():
         activity_loop.start()
+    if not cloud_backup_loop.is_running():
+        cloud_backup_loop.start()
     if not weekly_report_loop.is_running():
         weekly_report_loop.start()
     try:
@@ -770,8 +909,8 @@ async def on_message(message):
     author_id = message.author.id
     now = datetime.now()
     perms = message.author.guild_permissions
-    is_owner = (message.author.id == message.guild.owner_id)
-    is_admin_or_mod = perms.administrator or perms.manage_messages or perms.kick_members or perms.ban_members
+    is_trusted = is_trusted_role_manager(message.guild, message.author)
+    is_admin_or_mod = is_trusted or perms.administrator or perms.manage_messages or perms.kick_members or perms.ban_members
 
     if not is_admin_or_mod:
         content_lower = message.content.lower()
@@ -818,7 +957,7 @@ async def on_message(message):
 
     await bot.process_commands(message)
 
-    if not is_owner:
+    if not is_trusted:
         message_history[author_id].append(now)
         message_history[author_id] = [t for t in message_history[author_id] if now - t < timedelta(seconds=4)]
 
@@ -864,8 +1003,8 @@ async def give_coins(ctx, member: discord.Member = None, amount: int = 0):
     except Exception:
         pass
 
-    if ctx.author.id != ctx.guild.owner_id:
-        await ctx.send("❌ Тільки для Власника!", delete_after=5)
+    if not is_trusted_role_manager(ctx.guild, ctx.author):
+        await ctx.send("❌ Тільки для Власника або Заступника Власника!", delete_after=5)
         return
 
     if not member or amount <= 0:
@@ -874,9 +1013,10 @@ async def give_coins(ctx, member: discord.Member = None, amount: int = 0):
 
     user_coins[member.id] += amount
     save_data()
-    embed = discord.Embed(title="💳 Нарахування EC", description=f"👑 Власник нарахував **+{amount}** EC для {member.mention}!", color=discord.Color.gold())
+    await sync_cloud_backup()
+    embed = discord.Embed(title="💳 Нарахування EC", description=f"👑 {ctx.author.mention} нарахував **+{amount}** EC для {member.mention}!", color=discord.Color.gold())
     await ctx.send(embed=embed, delete_after=60)
-    await send_log(ctx.guild, "Видача валюти", f"Власник нарахував {amount} EC для {member.mention}.", discord.Color.gold())
+    await send_log(ctx.guild, "Видача валюти", f"{ctx.author.mention} нарахував {amount} EC для {member.mention}.", discord.Color.gold())
 
 
 @bot.command(name="ранг")
@@ -1011,6 +1151,7 @@ async def buy_item(ctx, item_id: str = None):
     user_coins[user_id] -= price
     await ctx.author.add_roles(role)
     save_data()
+    await sync_cloud_backup()
     
     await ctx.send(f"🎉 {ctx.author.mention}, ви успішно купили роль **{item['name']}**!", delete_after=60)
     await send_log(ctx.guild, "Покупка в магазині", f"Користувач {ctx.author.mention} купив роль **{item['name']}**.", discord.Color.blue())
@@ -1059,7 +1200,7 @@ async def text_links(ctx):
 async def on_member_ban(guild, user):
     async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.ban):
         executor = entry.user
-        if executor.bot or executor.id == guild.owner_id:
+        if executor.bot or is_trusted_role_manager(guild, executor):
             return
 
         now = datetime.now()
@@ -1074,7 +1215,7 @@ async def on_guild_channel_delete(channel):
     guild = channel.guild
     async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.channel_delete):
         executor = entry.user
-        if executor.bot or executor.id == guild.owner_id:
+        if executor.bot or is_trusted_role_manager(guild, executor):
             return
 
         now = datetime.now()
@@ -1089,7 +1230,7 @@ async def on_guild_role_delete(role):
     guild = role.guild
     async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.role_delete):
         executor = entry.user
-        if executor.bot or executor.id == guild.owner_id:
+        if executor.bot or is_trusted_role_manager(guild, executor):
             return
 
         now = datetime.now()
@@ -1103,7 +1244,7 @@ async def on_guild_role_delete(role):
 @bot.tree.command(name="help", description="Доступні команди")
 async def slash_help(interaction: discord.Interaction):
     embed = discord.Embed(title="📜 Меню команд", color=discord.Color.blue())
-    embed.add_field(name="`!givecoins`", value="Видати коїни (тільки Власнику)", inline=False)
+    embed.add_field(name="`!givecoins`", value="Видати коїни (Власнику / Заступнику)", inline=False)
     embed.add_field(name="`!бонус` / `!daily`", value="Щоденний бонус", inline=False)
     embed.add_field(name="`!магазин` / `!купити`", value="Магазин ролей", inline=False)
     embed.add_field(name="`!дуель`", value="Дуель на коїни", inline=False)
