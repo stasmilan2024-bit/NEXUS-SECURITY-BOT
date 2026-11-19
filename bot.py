@@ -67,7 +67,12 @@ def apply_data_dict(data: dict):
     for k, v in data.get("exp", {}).items():
         user_exp[int(k)] = max(user_exp[int(k)], int(v))
     for k, v in data.get("levels", {}).items():
-        user_levels[int(k)] = max(user_levels[int(k)], int(v))
+        uid = int(k)
+        lvl = max(1, min(500, int(v)))
+        user_levels[uid] = max(user_levels[uid], lvl)
+        min_exp = exp_for_level(user_levels[uid])
+        if user_exp[uid] < min_exp:
+            user_exp[uid] = min_exp
 
 def load_data():
     if os.path.exists(DATA_FILE):
@@ -170,7 +175,6 @@ async def restore_data_from_discord():
     """Відновлює статистику після перезапуску Render із бекап-повідомлення та топу статистики."""
     global db_backup_message_id, stats_message_id, data_restored
 
-    # 1. Спроба завантажити повну JSON-базу із закріпленого бекапу в лог-каналі
     log_channel = bot.get_channel(LOG_CHANNEL_ID)
     if log_channel:
         try:
@@ -186,7 +190,6 @@ async def restore_data_from_discord():
         except Exception as e:
             print(f"Помилка читання бекапу з лог-каналу: {e}")
 
-    # 2. Додатковий парсинг актуального повідомлення статистики (щоб не втратити свіжі цифри)
     stats_channel = bot.get_channel(STATS_CHANNEL_ID)
     if stats_channel:
         try:
@@ -215,6 +218,10 @@ async def restore_data_from_discord():
         except Exception as e:
             print(f"Помилка парсингу статистики: {e}")
 
+    for uid, lvl in list(user_levels.items()):
+        min_exp = exp_for_level(lvl)
+        if user_exp[uid] < min_exp:
+            user_exp[uid] = min_exp
     save_data()
     data_restored = True
 
@@ -261,6 +268,14 @@ def format_voice_time(total_seconds):
         return f"{seconds} сек."
 
 
+def exp_for_level(level: int) -> int:
+    """Повертає мінімальний сумарний EXP для досягнення заданого рівня (1..500)."""
+    if level <= 1:
+        return 0
+    capped = min(level, 500)
+    return sum(lvl * 150 for lvl in range(1, capped))
+
+
 def get_level_and_exp(exp_total):
     level = 1
     while level < 500:
@@ -282,10 +297,13 @@ def get_level_and_exp(exp_total):
 
 async def check_and_update_level(member, guild):
     user_id = member.id
+    min_required_exp = exp_for_level(user_levels[user_id])
+    if user_exp[user_id] < min_required_exp:
+        user_exp[user_id] = min_required_exp
     total_exp = user_exp[user_id]
     new_level, _, _ = get_level_and_exp(total_exp)
     
-    if user_levels[user_id] < new_level:
+    if new_level > user_levels[user_id]:
         user_levels[user_id] = new_level
         save_data()
 
@@ -475,7 +493,6 @@ async def on_member_join(member: discord.Member):
     guild = member.guild
     now = datetime.now(timezone.utc)
 
-    # 1. ЖОРСТКИЙ ANTI-BOT: Якщо додано стороннього бота (не Власником / Заступником)
     if member.bot:
         is_trusted_action = False
         try:
@@ -518,7 +535,6 @@ async def on_member_join(member: discord.Member):
             except Exception:
                 pass
 
-    # 2. ФІЛЬТР ВІКУ АКАУНТА (Анти-Твінк): Менше ніж 7 днів — кік
     account_age = now - member.created_at
     if account_age < timedelta(days=MIN_ACCOUNT_AGE_DAYS):
         days_old = account_age.days
@@ -541,7 +557,6 @@ async def on_member_join(member: discord.Member):
             print(f"Помилка Anti-Twink: {e}")
         return
 
-    # Якщо перевірки пройдено успішно
     channel = guild.get_channel(WELCOME_CHANNEL_ID)
     if channel:
         embed = discord.Embed(
@@ -781,9 +796,100 @@ async def vkick_room(ctx, member: discord.Member = None):
         await ctx.send("❌ Цього гравця немає у вашій кімнаті!", delete_after=5)
 
 
+# --- 🎮 МОНІТОРИНГ ОНЛАЙНУ MTA SERVER (51.75.44.12:22003) ---
+MTA_SERVER_IP = "51.75.44.12"
+MTA_SERVER_PORT = 22003
+MTA_QUERY_PORT = 22126  # Стандартний ASE порт MTA:SA (game_port + 123)
+mta_last_online_str = "0/100"
+
+
+def _query_mta_ase_sync(host: str, query_port: int, timeout: float = 0.8):
+    """Запитує статус сервера MTA:SA через протокол ASE (UDP)."""
+    import socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    try:
+        sock.sendto(b"s", (host, query_port))
+        data, _ = sock.recvfrom(4096)
+        if not data or len(data) < 5:
+            return None
+
+        # Парсинг стандартної відповіді ASE MTA:SA (після заголовка 'EYE1')
+        idx = 4 if data.startswith(b"EYE1") else 0
+        payload = data[idx:]
+
+        def read_str(buf, pos):
+            if pos >= len(buf):
+                return "", pos
+            length = buf[pos]
+            pos += 1
+            if length <= 0:
+                return "", pos
+            end = min(len(buf), pos + length - 1)
+            val = buf[pos:end].decode("latin-1", errors="ignore")
+            return val, pos + length
+
+        _, pos = read_str(payload, 0)       # game
+        _, pos = read_str(payload, pos)      # port
+        _, pos = read_str(payload, pos)      # name
+        _, pos = read_str(payload, pos)      # gamemode
+        _, pos = read_str(payload, pos)      # map
+        _, pos = read_str(payload, pos)      # version
+        _, pos = read_str(payload, pos)      # passworded
+
+        if pos + 2 > len(payload):
+            return None
+
+        players = payload[pos]
+        max_players = payload[pos + 1]
+        if max_players <= 0 or max_players > 4096:
+            return None
+        return int(players), int(max_players)
+    except Exception:
+        return None
+    finally:
+        sock.close()
+
+
+async def get_mta_online_text() -> str:
+    global mta_last_online_str
+    loop = asyncio.get_running_loop()
+    # Спочатку пробуємо стандартний ASE-порт (22126), потім 22003 на випадок кастомної конфігурації
+    res = await loop.run_in_executor(None, _query_mta_ase_sync, MTA_SERVER_IP, MTA_QUERY_PORT, 0.7)
+    if res is None:
+        res = await loop.run_in_executor(None, _query_mta_ase_sync, MTA_SERVER_IP, MTA_SERVER_PORT, 0.7)
+    if res is not None:
+        players, max_players = res
+        mta_last_online_str = f"{players}/{max_players}"
+    return mta_last_online_str
+
+
+async def update_bot_bio_online():
+    """Оновлює статус/біо бота з поточним онлайном MTA та синхронізує Application Bio (якщо доступно)."""
+    online_str = await get_mta_online_text()
+    status_text = f"MTA: {online_str} гравців"
+    try:
+        activity = discord.Activity(type=discord.ActivityType.watching, name=status_text)
+        await bot.change_presence(status=discord.Status.online, activity=activity)
+    except Exception as e:
+        print(f"Помилка оновлення статусу бота: {e}")
+
+    # Спроба оновити опис (Bio) застосунку бота через Discord API, якщо підтримується
+    try:
+        app_info = await bot.application_info()
+        bio_text = f"ELITE RP | Онлайн MTA ({MTA_SERVER_IP}:{MTA_SERVER_PORT}): {online_str}"
+        await bot.http.request(
+            discord.http.Route("PATCH", "/applications/{application_id}", application_id=app_info.id),
+            json={"description": bio_text}
+        )
+    except Exception:
+        pass
+
+
 # --- ФОНОВІ ЗАДАЧІ ---
 @tasks.loop(seconds=1)
 async def voice_counter_loop():
+    bot.loop.create_task(update_bot_bio_online())
     if not data_restored:
         return
     for guild in bot.guilds:
@@ -881,6 +987,7 @@ async def before_weekly_loop():
 async def on_ready():
     print(f'Бот увійшов як {bot.user} і працює успішно!')
     await restore_data_from_discord()
+    await update_bot_bio_online()
     bot.add_view(TicketPanelView())
     bot.add_view(AdminReplyView())
     await setup_ticket_panel()
@@ -1031,8 +1138,14 @@ async def text_rank(ctx):
         return
 
     user_id = ctx.author.id
+    min_required_exp = exp_for_level(user_levels[user_id])
+    if user_exp[user_id] < min_required_exp:
+        user_exp[user_id] = min_required_exp
     total_exp = user_exp[user_id]
-    level, current_exp, max_exp = get_level_and_exp(total_exp)
+    calc_level, current_exp, max_exp = get_level_and_exp(total_exp)
+    if calc_level > user_levels[user_id]:
+        user_levels[user_id] = calc_level
+    level = user_levels[user_id]
 
     progress_blocks = 10
     filled_blocks = int((current_exp / max_exp) * progress_blocks) if max_exp > 0 else 0
