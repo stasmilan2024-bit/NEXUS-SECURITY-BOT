@@ -1,3 +1,743 @@
+import os
+import re
+import json
+import random
+import asyncio
+import threading
+import collections
+from datetime import datetime, timedelta, timezone
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+import discord
+from discord.ext import commands, tasks
+from discord import app_commands
+
+# --- ВЕБ-СЕРВЕР ДЛЯ RENDER ---
+def run_server():
+    class SimpleHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"Bot is alive!")
+    
+    server = HTTPServer(('0.0.0.0', 10000), SimpleHandler)
+    server.serve_forever()
+
+threading.Thread(target=run_server, daemon=True).start()
+
+# --- ІНІЦІАЛІЗАЦІЯ БОТА ---
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+intents.guilds = True
+intents.moderation = True
+intents.voice_states = True
+intents.webhooks = True
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# --- ЗБЕРЕЖЕННЯ ТА ВІДНОВЛЕННЯ ДАНИХ (ХМАРНИЙ БЕКАП У DISCORD + JSON) ---
+DATA_FILE = "data.json"
+
+user_messages = collections.defaultdict(int)
+user_voice_seconds = collections.defaultdict(int)
+user_coins = collections.defaultdict(int)
+user_exp = collections.defaultdict(int)
+user_levels = collections.defaultdict(lambda: 1)
+
+db_backup_message_id = None
+data_restored = False
+
+def serialize_data_dict():
+    return {
+        "messages": {str(k): v for k, v in user_messages.items() if v > 0},
+        "voice": {str(k): v for k, v in user_voice_seconds.items() if v > 0},
+        "coins": {str(k): v for k, v in user_coins.items() if v > 0},
+        "exp": {str(k): v for k, v in user_exp.items() if v > 0},
+        "levels": {str(k): v for k, v in user_levels.items() if v > 1}
+    }
+
+def apply_data_dict(data: dict):
+    for k, v in data.get("messages", {}).items():
+        user_messages[int(k)] = max(user_messages[int(k)], int(v))
+    for k, v in data.get("voice", {}).items():
+        user_voice_seconds[int(k)] = max(user_voice_seconds[int(k)], int(v))
+    for k, v in data.get("coins", {}).items():
+        user_coins[int(k)] = max(user_coins[int(k)], int(v))
+    for k, v in data.get("exp", {}).items():
+        user_exp[int(k)] = max(user_exp[int(k)], int(v))
+    for k, v in data.get("levels", {}).items():
+        uid = int(k)
+        lvl = max(1, min(500, int(v)))
+        user_levels[uid] = max(user_levels[uid], lvl)
+        min_exp = exp_for_level(user_levels[uid])
+        if user_exp[uid] < min_exp:
+            user_exp[uid] = min_exp
+
+def load_data():
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                apply_data_dict(json.load(f))
+            print("💾 Дані завантажено з локального data.json!")
+        except Exception as e:
+            print(f"Помилка читання data.json: {e}")
+
+def save_data():
+    try:
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(serialize_data_dict(), f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        print(f"Помилка збереження у data.json: {e}")
+
+load_data()
+
+message_history = collections.defaultdict(list)
+ban_history = collections.defaultdict(list)
+channel_delete_history = collections.defaultdict(list)
+role_delete_history = collections.defaultdict(list)
+last_user_messages = collections.defaultdict(list)
+admin_spam_warnings = collections.defaultdict(int)
+last_daily_claim = {}
+
+# --- НАЛАШТУВАННЯ БЕЗПЕКИ ---
+MIN_ACCOUNT_AGE_DAYS = 7
+
+# Ролі, яким дозволено видавати будь-які ролі та редагувати права без блокування
+TRUSTED_ROLE_NAMES = {
+    "власник",
+    "заступник власника",
+}
+
+def is_trusted_role_manager(guild: discord.Guild, user: discord.User | discord.Member | None) -> bool:
+    if not guild or not user or user.bot:
+        return False
+    if user.id == guild.owner_id:
+        return True
+    member = guild.get_member(user.id)
+    if not member:
+        return False
+    return any(role.name.strip().lower() in TRUSTED_ROLE_NAMES for role in member.roles)
+
+# --- ID КАНАЛІВ ТА НАЛАШТУВАННЯ ---
+WELCOME_CHANNEL_ID = 1566880572029018203
+STATS_CHANNEL_ID = 1568373943138787349  
+RANK_CHANNEL_ID = 1405600879587098644      
+LOG_CHANNEL_ID = 1569067419740278936      
+ADMIN_QUESTIONS_CHANNEL_ID = 1570510766186958858  
+TICKET_PANEL_CHANNEL_ID = 1570511794190028960    
+
+CREATE_VOICE_CHANNEL_ID = 1405601386674130965
+PRIVATE_ROOMS_CATEGORY_ID = 1405600664704254103
+
+active_private_channels = {}
+
+# --- ПОСИЛАННЯ НА СОЦМЕРЕЖІ ---
+URL_SITE = "https://elite-rp.qniks.me"                     
+URL_FORUM = "http://eliterpforum.sytes.net/index.php"       
+URL_TG_CHANNEL = "🚧 В розробці"                            
+URL_TG_CHAT = "🚧 В розробці"                               
+URL_TG_BOT = "🚧 В розробці"                                
+URL_TIKTOK = "https://www.tiktok.com/@your_tiktok"          
+URL_INSTAGRAM = "https://www.instagram.com/your_instagram"  
+
+# --- ID РОЛЕЙ АКТИВНОСТІ ---
+ROLE_ACTIVE_ID = 1405600607427100854      
+ROLE_MASTER_ID = 1405600608576213002      
+ROLE_INCREDIBLE_ID = 1405600522010103949  
+ROLE_MOST_ACTIVE_ID = 1405600525826920568 
+
+SHOP_ITEMS = {
+    "1": {"name": "🎖️ Роль 'Активний'", "price": 150, "role_id": ROLE_ACTIVE_ID},
+    "2": {"name": "💬 Роль 'Майстер'", "price": 300, "role_id": ROLE_MASTER_ID},
+    "3": {"name": "🔥 Роль 'Неймовірний'", "price": 500, "role_id": ROLE_INCREDIBLE_ID},
+    "4": {"name": "👑 Роль 'Найактивніший'", "price": 1000, "role_id": ROLE_MOST_ACTIVE_ID}
+}
+
+stats_message_id = None
+
+
+def parse_voice_time(text: str) -> int:
+    hours = re.search(r'(\d+)\s*год\.', text)
+    minutes = re.search(r'(\d+)\s*хв\.', text)
+    seconds = re.search(r'(\d+)\s*сек\.', text)
+    total = 0
+    if hours:
+        total += int(hours.group(1)) * 3600
+    if minutes:
+        total += int(minutes.group(1)) * 60
+    if seconds:
+        total += int(seconds.group(1))
+    return total
+
+
+async def restore_data_from_discord():
+    """Відновлює статистику після перезапуску Render із бекап-повідомлення та топу статистики."""
+    global db_backup_message_id, stats_message_id, data_restored
+
+    log_channel = bot.get_channel(LOG_CHANNEL_ID)
+    if log_channel:
+        try:
+            pins = await log_channel.pins()
+            for pin in pins:
+                if pin.author == bot.user and pin.content.startswith("📦 `ELITE_DB_BACKUP`"):
+                    db_backup_message_id = pin.id
+                    match = re.search(r'```json\n(.*?)\n```', pin.content, re.DOTALL)
+                    if match:
+                        apply_data_dict(json.loads(match.group(1)))
+                        print("☁️ Повну базу даних відновлено з хмарного бекапу Discord!")
+                    break
+        except Exception as e:
+            print(f"Помилка читання бекапу з лог-каналу: {e}")
+
+    stats_channel = bot.get_channel(STATS_CHANNEL_ID)
+    if stats_channel:
+        try:
+            async for message in stats_channel.history(limit=10):
+                if message.author == bot.user and message.embeds:
+                    emb = message.embeds[0]
+                    if "Статистика активності гравців" in (emb.title or ""):
+                        stats_message_id = message.id
+                        for field in emb.fields:
+                            if "повідомленнями" in field.name:
+                                for line in field.value.splitlines():
+                                    m = re.search(r'<@!?(\d+)>.*?(\d+)\*\*\s*пов\.', line)
+                                    if m:
+                                        uid, cnt = int(m.group(1)), int(m.group(2))
+                                        user_messages[uid] = max(user_messages[uid], cnt)
+                            elif "войсі" in field.name:
+                                for line in field.value.splitlines():
+                                    m = re.search(r'<@!?(\d+)>.*?\*\*(.*?)\*\*', line)
+                                    if m:
+                                        uid, v_str = int(m.group(1)), m.group(2)
+                                        secs = parse_voice_time(v_str)
+                                        if secs > 0:
+                                            user_voice_seconds[uid] = max(user_voice_seconds[uid], secs)
+                        print("📊 Дані синхронізовано з повідомлення статистики!")
+                        break
+        except Exception as e:
+            print(f"Помилка парсингу статистики: {e}")
+
+    for uid, lvl in list(user_levels.items()):
+        min_exp = exp_for_level(lvl)
+        if user_exp[uid] < min_exp:
+            user_exp[uid] = min_exp
+    save_data()
+    data_restored = True
+
+
+async def sync_cloud_backup():
+    """Зберігає повну копію статистики у закріпленому повідомленні в лог-каналі."""
+    global db_backup_message_id
+    if not data_restored:
+        return
+    log_channel = bot.get_channel(LOG_CHANNEL_ID)
+    if not log_channel:
+        return
+
+    payload = json.dumps(serialize_data_dict(), ensure_ascii=False, separators=(',', ':'))
+    if len(payload) > 1900:
+        return
+
+    content = f"📦 `ELITE_DB_BACKUP` (Автозбереження статистики — не видаляти)\n```json\n{payload}\n```"
+    try:
+        if db_backup_message_id:
+            try:
+                msg = await log_channel.fetch_message(db_backup_message_id)
+                await msg.edit(content=content)
+                return
+            except Exception:
+                db_backup_message_id = None
+
+        msg = await log_channel.send(content=content)
+        await msg.pin()
+        db_backup_message_id = msg.id
+    except Exception as e:
+        print(f"Помилка хмарного бекапу: {e}")
+
+
+def format_voice_time(total_seconds):
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    seconds = total_seconds % 60
+    if hours > 0:
+        return f"{hours} год. {minutes} хв. {seconds} сек."
+    elif minutes > 0:
+        return f"{minutes} хв. {seconds} сек."
+    else:
+        return f"{seconds} сек."
+
+
+
+def exp_for_level(level: int) -> int:
+    """Повертає мінімальний сумарний EXP для досягнення заданого рівня (1..500)."""
+    if level <= 1:
+        return 0
+    capped = min(level, 500)
+    return sum(lvl * 150 for lvl in range(1, capped))
+
+def get_level_and_exp(exp_total):
+    level = 1
+    while level < 500:
+        exp_needed = level * 150
+        if exp_total >= exp_needed:
+            exp_total -= exp_needed
+            level += 1
+        else:
+            break
+    
+    if level >= 500:
+        level = 500
+        exp_needed = 500 * 150
+        exp_total = exp_needed
+
+    current_level_exp_max = level * 150
+    return level, exp_total, current_level_exp_max
+
+
+async def check_and_update_level(member, guild):
+    user_id = member.id
+    min_required_exp = exp_for_level(user_levels[user_id])
+    if user_exp[user_id] < min_required_exp:
+        user_exp[user_id] = min_required_exp
+    total_exp = user_exp[user_id]
+    new_level, _, _ = get_level_and_exp(total_exp)
+    
+    if new_level > user_levels[user_id]:
+        user_levels[user_id] = new_level
+        save_data()
+
+        rank_channel = guild.get_channel(RANK_CHANNEL_ID)
+        if rank_channel:
+            embed = discord.Embed(
+                title="🎉 Підвищення рівня!",
+                description=f"Вітаємо, {member.mention}! Ви досягли **{new_level} рівня** на сервері! 🌟",
+                color=discord.Color.gold()
+            )
+            embed.set_thumbnail(url=member.display_avatar.url)
+            await rank_channel.send(embed=embed, delete_after=120)
+
+        await send_log(guild, "Підвищення рівня", f"Користувач {member.mention} підвищив рівень до **{new_level}**.", discord.Color.gold())
+
+
+async def send_log(guild, title, description, color=discord.Color.blue(), ping_owner=False):
+    if not guild:
+        return
+    channel = guild.get_channel(LOG_CHANNEL_ID)
+    if channel:
+        embed = discord.Embed(title=f"🛡️ ЛОГ ДІЙ | {title}", description=description, color=color, timestamp=datetime.now(timezone.utc))
+        content = guild.owner.mention if (ping_owner and guild.owner) else None
+        try:
+            await channel.send(content=content, embed=embed)
+        except Exception as e:
+            print(f"Помилка відправки логу: {e}")
+
+
+async def punish_rogue_admin(guild, executor, reason):
+    if not executor or executor.bot or is_trusted_role_manager(guild, executor):
+        return
+    try:
+        member = guild.get_member(executor.id)
+        if member:
+            roles_to_remove = [r for r in member.roles if r != guild.default_role and r.is_assignable()]
+            if roles_to_remove:
+                await member.remove_roles(*roles_to_remove, reason=reason)
+        await guild.ban(executor, reason=reason)
+        await send_log(
+            guild,
+            "🚨 CRITICAL SECURITY | Блокування адміністратора",
+            f"**Порушник:** `{executor}` (`{executor.id}`)\n**Причина:** {reason}\n**Дія:** Усі ролі знято, акаунт заблоковано.",
+            discord.Color.dark_red(),
+            ping_owner=True
+        )
+    except Exception as e:
+        print(f"Помилка нейтралізації порушника: {e}")
+
+
+# --- 🎫 СИСТЕМА ЗВЕРНЕНЬ ТА ПІДТРИМКИ ---
+
+class AdminReplyModal(discord.ui.Modal, title="Відповідь адміністрації"):
+    reply_text = discord.ui.TextInput(
+        label="Ваша відповідь гравцю",
+        style=discord.TextStyle.paragraph,
+        placeholder="Напишіть детальну відповідь на запитання...",
+        required=True,
+        max_length=1000
+    )
+
+    def __init__(self, target_user_id: int, question_text: str):
+        super().__init__()
+        self.target_user_id = target_user_id
+        self.question_text = question_text
+
+    async def on_submit(self, interaction: discord.Interaction):
+        embed = interaction.message.embeds[0]
+        embed.color = discord.Color.green()
+        embed.add_field(
+            name=f"✅ Відповідь від {interaction.user.display_name}:",
+            value=self.reply_text.value,
+            inline=False
+        )
+        embed.set_footer(text="Статус: Відповідь надано")
+
+        await interaction.message.edit(embed=embed, view=None)
+        await interaction.response.send_message("✅ Відповідь опубліковано!", ephemeral=True)
+
+        target_member = interaction.guild.get_member(self.target_user_id)
+        if target_member:
+            try:
+                dm_embed = discord.Embed(
+                    title="📩 Відповідь на ваше звернення | ELITE RP",
+                    description=f"**Ваше питання:**\n{self.question_text}\n\n**Відповідь адміністратора ({interaction.user.display_name}):**\n{self.reply_text.value}",
+                    color=discord.Color.green()
+                )
+                await target_member.send(embed=dm_embed)
+            except Exception:
+                pass
+
+        await send_log(interaction.guild, "Відповідь на тікет", f"Адміністратор {interaction.user.mention} відповів на звернення гравця <@{self.target_user_id}>.", discord.Color.green())
+
+
+class AdminReplyView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="💬 Відповісти (Для Адміністрації)", style=discord.ButtonStyle.primary, custom_id="admin_reply_ticket_btn")
+    async def reply_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        perms = interaction.user.guild_permissions
+        if not (perms.administrator or perms.manage_messages or perms.kick_members):
+            await interaction.response.send_message("❌ Відповідати на звернення може лише адміністрація!", ephemeral=True)
+            return
+
+        embed = interaction.message.embeds[0]
+        footer_text = embed.footer.text or ""
+        user_id = 0
+        if "ID:" in footer_text:
+            try:
+                user_id = int(footer_text.split("ID:")[1].strip())
+            except Exception:
+                pass
+        
+        question_text = embed.description or ""
+        await interaction.response.send_modal(AdminReplyModal(user_id, question_text))
+
+
+class AskQuestionModal(discord.ui.Modal, title="Нове питання до адміністрації"):
+    question = discord.ui.TextInput(
+        label="Опишіть ваше питання або проблему",
+        style=discord.TextStyle.paragraph,
+        placeholder="Напишіть тут ваше звернення...",
+        required=True,
+        max_length=1000
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        admin_channel = interaction.guild.get_channel(ADMIN_QUESTIONS_CHANNEL_ID)
+        if not admin_channel:
+            await interaction.response.send_message("❌ Канал для адміністраторів не знайдено.", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title=f"🎫 Звернення від {interaction.user.display_name}",
+            description=f"**Питання:**\n{self.question.value}",
+            color=discord.Color.orange(),
+            timestamp=datetime.now(timezone.utc)
+        )
+        embed.set_thumbnail(url=interaction.user.display_avatar.url)
+        embed.add_field(name="👤 Автор", value=interaction.user.mention, inline=True)
+        embed.set_footer(text=f"Очікує відповіді | ID: {interaction.user.id}")
+
+        await admin_channel.send(embed=embed, view=AdminReplyView())
+        await interaction.response.send_message("✅ Ваше питання успішно надіслано адміністрації!", ephemeral=True)
+        await send_log(interaction.guild, "Нове звернення", f"Користувач {interaction.user.mention} залишив питання для адміністрації.", discord.Color.orange())
+
+
+class TicketPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="🎟️ Задати питання", style=discord.ButtonStyle.success, custom_id="ask_ticket_btn")
+    async def ask_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(AskQuestionModal())
+
+
+async def setup_ticket_panel():
+    panel_channel = bot.get_channel(TICKET_PANEL_CHANNEL_ID)
+    if not panel_channel:
+        return
+
+    embed = discord.Embed(
+        title="🎫 ПІДТРИМКА ТА ЗВЕРНЕННЯ | ELITE RP",
+        description="Маєте запитання до адміністрації або потрібна допомога?\nНатисніть кнопку **«Задати питання»** нижче, заповніть форму, і ваше звернення надійде адміністраторам.",
+        color=discord.Color.gold()
+    )
+    embed.set_footer(text="ELITE RP | Панель звернень")
+
+    try:
+        pins = await panel_channel.pins()
+        for pin in pins:
+            if pin.author == bot.user and pin.embeds and "ПІДТРИМКА ТА ЗВЕРНЕННЯ" in (pin.embeds[0].title or ""):
+                await pin.edit(embed=embed, view=TicketPanelView())
+                return
+        
+        msg = await panel_channel.send(embed=embed, view=TicketPanelView())
+        await msg.pin()
+    except Exception as e:
+        print(f"Помилка закріплення панелі звернень: {e}")
+
+
+# --- 🛡️ ЖОРСТКИЙ ANTI-BOT ТА ANTI-TWINK ЩИТ (ВХІД НА СЕРВЕР) ---
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    guild = member.guild
+    now = datetime.now(timezone.utc)
+
+    if member.bot:
+        is_trusted_action = False
+        try:
+            async for entry in guild.audit_logs(limit=3, action=discord.AuditLogAction.bot_add):
+                if entry.target and entry.target.id == member.id:
+                    if not is_trusted_role_manager(guild, entry.user):
+                        try:
+                            await member.ban(reason="Anti-Bot: Сторонніх ботів заборонено!")
+                        except Exception:
+                            pass
+                        
+                        try:
+                            rogue_admin = guild.get_member(entry.user.id)
+                            if rogue_admin:
+                                roles_to_remove = [r for r in rogue_admin.roles if r != guild.default_role and r.is_assignable()]
+                                if roles_to_remove:
+                                    await rogue_admin.remove_roles(*roles_to_remove, reason="Додав стороннього бота")
+                                await guild.ban(rogue_admin, reason="Додав стороннього бота на сервер")
+                        except Exception:
+                            pass
+
+                        await send_log(
+                            guild,
+                            "🚨 ANTI-BOT ЗАХИСТ",
+                            f"**Чужий бот:** {member.mention} (`{member.id}`)\n**Кого задіяли:** <@{entry.user.id}>\n**Дія:** Обох миттєво заблоковано!",
+                            discord.Color.dark_red(),
+                            ping_owner=True
+                        )
+                        return
+                    else:
+                        is_trusted_action = True
+                        break
+        except Exception as e:
+            print(f"Помилка перевірки аудит-логів бота: {e}")
+
+        if not is_trusted_action:
+            try:
+                await member.ban(reason="Anti-Bot: Несанкціонований бот")
+                return
+            except Exception:
+                pass
+
+    account_age = now - member.created_at
+    if account_age < timedelta(days=MIN_ACCOUNT_AGE_DAYS):
+        days_old = account_age.days
+        try:
+            await member.send(
+                f"🛡️ **Система безпеки ELITE RP:**\nВаш акаунт створено занадто недавно ({days_old} дн.). "
+                f"Для захисту від твінків мінімальний вік акаунта становить **{MIN_ACCOUNT_AGE_DAYS} днів**."
+            )
+        except Exception:
+            pass
+        try:
+            await member.kick(reason=f"Anti-Twink: Вік акаунта {days_old} дн. (мін. {MIN_ACCOUNT_AGE_DAYS} дн.)")
+            await send_log(
+                guild,
+                "🕵️ Anti-Twink Блокування",
+                f"Користувача `{member}` (`{member.id}`) не допущено на сервер.\n**Вік акаунта:** {days_old} дн. (поріг: {MIN_ACCOUNT_AGE_DAYS} дн.)",
+                discord.Color.orange()
+            )
+        except Exception as e:
+            print(f"Помилка Anti-Twink: {e}")
+        return
+
+    channel = guild.get_channel(WELCOME_CHANNEL_ID)
+    if channel:
+        embed = discord.Embed(
+            title=f"Вітаємо на ELITE RP, {member.name}! 👋",
+            description=f"Привіт, {member.mention}!\n\n**Раді бачити тебе на нашому сервері!** 🎉",
+            color=discord.Color.blue()
+        )
+        embed.set_thumbnail(url=member.display_avatar.url)
+        await channel.send(embed=embed)
+    await send_log(guild, "Новий учасник", f"Користувач {member.mention} (`{member.name}`) пройшов перевірку безпеки та приєднався.", discord.Color.green())
+
+
+# --- 🧬 КОНТРОЛЬ ЦІЛІСНОСТІ ПРАВ, РОЛЕЙ ТА ВЕБХУКІВ ---
+
+@bot.event
+async def on_guild_role_update(before: discord.Role, after: discord.Role):
+    guild = after.guild
+    dangerous_perms = [
+        after.permissions.administrator,
+        after.permissions.manage_guild,
+        after.permissions.manage_roles,
+        after.permissions.ban_members,
+        after.permissions.manage_webhooks,
+        after.permissions.manage_channels
+    ]
+    before_dangerous = [
+        before.permissions.administrator,
+        before.permissions.manage_guild,
+        before.permissions.manage_roles,
+        before.permissions.ban_members,
+        before.permissions.manage_webhooks,
+        before.permissions.manage_channels
+    ]
+
+    if any(dangerous_perms) and not any(before_dangerous):
+        async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.role_update):
+            if entry.target.id == after.id and not entry.user.bot:
+                if is_trusted_role_manager(guild, entry.user):
+                    break
+                try:
+                    await after.edit(permissions=before.permissions, reason="Anti-Privilege Escalation: Відкат небезпечних прав")
+                except Exception:
+                    pass
+                await punish_rogue_admin(guild, entry.user, f"Спроба видати небезпечні права ролі `{after.name}`")
+
+
+@bot.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+    guild = after.guild
+
+    if before.roles != after.roles:
+        added_roles = [r for r in after.roles if r not in before.roles]
+        removed_roles = [r for r in before.roles if r not in after.roles]
+
+        for role in added_roles:
+            if role.permissions.administrator or role.permissions.manage_guild:
+                async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.member_role_update):
+                    if entry.target.id == after.id and not entry.user.bot:
+                        if is_trusted_role_manager(guild, entry.user):
+                            break
+                        try:
+                            await after.remove_roles(role, reason="Anti-Admin Grant: Несанкціонована видача адмін-ролі")
+                        except Exception:
+                            pass
+                        await punish_rogue_admin(guild, entry.user, f"Спроба видати адмін-роль `{role.name}` гравцю `{after}`")
+                        return
+
+            await send_log(guild, "Видача ролі", f"Користувачу {after.mention} видано роль **{role.name}**.", discord.Color.green())
+        
+        for role in removed_roles:
+            await send_log(guild, "Зняття ролі", f"З користувача {after.mention} знято роль **{role.name}**.", discord.Color.red())
+
+    if before.nick != after.nick:
+        old_nick = before.nick or before.name
+        new_nick = after.nick or after.name
+        await send_log(guild, "Зміна нікнейма", f"Користувач {after.mention} змінив нікнейм:\nСтарий: `{old_nick}`\nНовий: `{new_nick}`", discord.Color.purple())
+
+
+@bot.event
+async def on_webhooks_update(channel):
+    guild = channel.guild
+    async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.webhook_create):
+        if not is_trusted_role_manager(guild, entry.user) and not entry.user.bot:
+            try:
+                webhooks = await channel.webhooks()
+                for wh in webhooks:
+                    if wh.id == entry.target.id:
+                        await wh.delete(reason="Anti-Webhook Trap: Заборонено створювати вебхуки")
+            except Exception:
+                pass
+            await punish_rogue_admin(guild, entry.user, f"Спроба створити вебхук у каналі `#{channel.name}`")
+
+
+# --- СИСТЕМА ЛОГУВАННЯ ТА ВОЙСІВ ---
+
+@bot.event
+async def on_message_delete(message):
+    if message.author.bot or message.guild is None:
+        return
+    
+    if message.content.startswith("!") or message.content.startswith("/"):
+        return
+
+    author_id = message.author.id
+    if user_messages[author_id] > 0:
+        user_messages[author_id] -= 1
+        save_data()
+
+    content = message.content if message.content else "*[Медіафайл / Вкладення]*"
+    desc = f"**Автор:** {message.author.mention}\n**Канал:** {message.channel.mention}\n**Повідомлення:** {content}"
+    await send_log(message.guild, "Видалення повідомлення", desc, discord.Color.orange())
+
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    if member.bot:
+        return
+
+    guild = member.guild
+
+    if after.channel and after.channel.id == CREATE_VOICE_CHANNEL_ID:
+        category = guild.get_channel(PRIVATE_ROOMS_CATEGORY_ID)
+        cat_obj = category if isinstance(category, discord.CategoryChannel) else None
+        
+        room_name = f"🔊 | Кімната {member.name}"
+        try:
+            new_channel = await guild.create_voice_channel(name=room_name, category=cat_obj)
+            await new_channel.set_permissions(member, manage_channels=True, move_members=True, connect=True)
+            await member.move_to(new_channel)
+            active_private_channels[new_channel.id] = member.id
+            await send_log(guild, "Створення кімнати", f"Користувач {member.mention} створив приватний войс: **{room_name}**", discord.Color.green())
+        except Exception as e:
+            print(f"Помилка створення приватної кімнати: {e}")
+
+    if before.channel != after.channel:
+        if before.channel is None and after.channel is not None:
+            await send_log(guild, "Вхід у войс", f"Користувач {member.mention} зайшов у голосовий канал **{after.channel.name}**.", discord.Color.blue())
+        elif before.channel is not None and after.channel is None:
+            await send_log(guild, "Вихід з войсу", f"Користувач {member.mention} вийшов із голосового каналу **{before.channel.name}**.", discord.Color.blue())
+        elif before.channel is not None and after.channel is not None:
+            await send_log(guild, "Переміщення у войсі", f"Користувач {member.mention} перейшов з **{before.channel.name}** у **{after.channel.name}**.", discord.Color.blue())
+
+    if before.channel and before.channel.id in active_private_channels:
+        if len(before.channel.members) == 0:
+            try:
+                ch_name = before.channel.name
+                ch_id = before.channel.id
+                await before.channel.delete()
+                active_private_channels.pop(ch_id, None)
+                await send_log(before.guild, "Видалення кімнати", f"Порожню приватну кімнату **{ch_name}** було автоматично видалено.", discord.Color.orange())
+            except Exception as e:
+                print(f"Помилка видалення приватної кімнати: {e}")
+
+
+# --- 🔊 КОМАНДИ КЕРУВАННЯ ПРИВАТНИМИ КІМНАТАМИ ---
+
+def is_room_owner():
+    async def predicate(ctx):
+        if not ctx.author.voice or not ctx.author.voice.channel:
+            await ctx.send("❌ Ви повинні перебувати у своїй приватній кімнаті!", delete_after=5)
+            return False
+        channel_id = ctx.author.voice.channel.id
+        if channel_id not in active_private_channels or active_private_channels[channel_id] != ctx.author.id:
+            await ctx.send("❌ Ви не є власником цієї приватної кімнати!", delete_after=5)
+            return False
+        return True
+    return commands.check(predicate)
+
+@bot.command(name="lock", aliases=["закрити"])
+@is_room_owner()
+async def lock_room(ctx):
+    try:
+        await ctx.message.delete()
+    except Exception:
+        pass
+    channel = ctx.author.voice.channel
+    await channel.set_permissions(ctx.guild.default_role, connect=False)
+    await ctx.send(f"🔒 {ctx.author.mention} закрив кімнату **{channel.name}** для входу!", delete_after=10)
+
+@bot.command(name="unlock", aliases=["відкрити"])
+@is_room_owner()
 async def unlock_room(ctx):
     try:
         await ctx.message.delete()
@@ -729,3 +1469,4 @@ if __name__ == '__main__':
         bot.run(TOKEN)
     else:
         print("Помилка: Не знайдено DISCORD_TOKEN!")
+Выполняю анализ
